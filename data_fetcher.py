@@ -1,100 +1,89 @@
 # data_fetcher.py
 import yfinance as yf
 from newsapi import NewsApiClient
-import requests
-from bs4 import BeautifulSoup
+import requests # Keep for future Indian scraping
+from bs4 import BeautifulSoup # Keep for future Indian scraping
 import logging
-from config import NEWSAPI_KEY # Import API key
+from config import NEWSAPI_KEY, NEWS_ARTICLE_COUNT
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Initialize NewsAPI client if key exists
+# Initialize NewsAPI client
 if NEWSAPI_KEY:
     newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
 else:
     newsapi = None
     logging.warning("NewsAPI client not initialized because NEWSAPI_KEY is missing.")
 
-# --- Placeholder Functions for Phase 0 ---
+# --- Phase 1 Implementation ---
 
 def get_stock_info(ticker):
-    """
-    Fetches basic stock information using yfinance.
-    (Phase 1 Implementation Needed)
-    """
-    logging.info(f"Placeholder: Fetching stock info for {ticker}")
-    # --- Implementation for Phase 1 ---
-    # try:
-    #     stock = yf.Ticker(ticker)
-    #     info = stock.info # Fetch basic info
-    #     # Fetch current price - more robust methods exist for real-time
-    #     hist = stock.history(period="1d")
-    #     current_price = hist['Close'].iloc[-1] if not hist.empty else info.get('currentPrice', 'N/A')
-    #     logging.info(f"Fetched info for {ticker}")
-    #     return {"info": info, "current_price": current_price}
-    # except Exception as e:
-    #     logging.error(f"Error fetching yfinance data for {ticker}: {e}")
-    #     return None
-    # -----------------------------------
-    print(f"[Placeholder] Would fetch yfinance data for {ticker}")
-    return {"info": {"symbol": ticker, "longName": "Placeholder Company Name"}, "current_price": 100.00} # Dummy data
+    """Fetches basic stock information and current price using yfinance."""
+    logging.info(f"Attempting to fetch stock info for {ticker} using yfinance.")
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
 
-def get_us_news(ticker_or_company_name):
-    """
-    Fetches news articles for a US stock using NewsAPI.
-    (Phase 1 Implementation Needed)
-    """
-    logging.info(f"Placeholder: Fetching US news for {ticker_or_company_name}")
+        # Check if info was successfully retrieved
+        if not info or info.get('regularMarketPrice') is None: # Check for a key field
+             logging.warning(f"Could not retrieve valid info for ticker {ticker}. It might be delisted or invalid.")
+             # Try history as fallback for price if info missing
+             hist = stock.history(period="1d")
+             current_price = hist['Close'].iloc[-1] if not hist.empty else 'N/A'
+             company_name = ticker # Default to ticker if name not found
+             info_dict = {'symbol': ticker, 'longName': company_name} # Basic fallback info
+        else:
+            current_price = info.get('currentPrice', info.get('regularMarketPrice', 'N/A')) # Prefer currentPrice if available
+            company_name = info.get('longName', ticker)
+            info_dict = info # Use the full info dict
+
+        logging.info(f"Successfully fetched yfinance data for {ticker}")
+        return {"info": info_dict, "current_price": current_price, "company_name": company_name}
+
+    except Exception as e:
+        # Common errors include connection issues, or invalid tickers yfinance cannot resolve
+        logging.error(f"Error fetching yfinance data for {ticker}: {e}")
+        return None # Indicate failure
+
+def get_us_news(query, articles_count=NEWS_ARTICLE_COUNT):
+    """Fetches news articles for a US stock query using NewsAPI."""
     if not newsapi:
         logging.error("Cannot fetch US news: NewsAPI client not available.")
-        return []
-    # --- Implementation for Phase 1 ---
-    # try:
-    #     # Use q for keyword search, consider adding sources or domains
-    #     all_articles = newsapi.get_everything(q=ticker_or_company_name,
-    #                                           language='en',
-    #                                           sort_by='publishedAt', # or relevancy
-    #                                           page_size=20) # Adjust page size as needed
-    #     logging.info(f"Fetched {len(all_articles.get('articles', []))} articles for {ticker_or_company_name} from NewsAPI.")
-    #     # Return a list of dictionaries with relevant fields
-    #     return all_articles.get('articles', [])
-    # except Exception as e:
-    #     logging.error(f"Error fetching NewsAPI data for {ticker_or_company_name}: {e}")
-    #     return []
-    # -----------------------------------
-    print(f"[Placeholder] Would fetch NewsAPI data for {ticker_or_company_name}")
-    # Dummy data
-    return [
-        {'title': 'Placeholder News Headline 1', 'url': 'http://example.com/news1', 'source': {'name': 'Example Source'}, 'publishedAt': '2023-01-01T12:00:00Z'},
-        {'title': 'Placeholder News Headline 2', 'url': 'http://example.com/news2', 'source': {'name': 'Another Source'}, 'publishedAt': '2023-01-01T11:00:00Z'}
-    ]
+        return [] # Return empty list if client not set up
 
+    logging.info(f"Fetching up to {articles_count} US news articles for query: '{query}' from NewsAPI.")
+    try:
+        # Use 'q' for keyword search. Consider adding domains for reliability e.g., domains='wsj.com,reuters.com'
+        all_articles = newsapi.get_everything(q=query,
+                                              language='en',
+                                              sort_by='publishedAt', # Use 'relevancy' if preferred
+                                              page_size=articles_count, # Fetch desired count
+                                              page=1) # Get the first page
+
+        fetched_articles = all_articles.get('articles', [])
+        logging.info(f"Fetched {len(fetched_articles)} articles for '{query}' from NewsAPI.")
+        # Optional: Add basic filtering here if needed (e.g., ensure title isn't '[Removed]')
+        filtered_articles = [a for a in fetched_articles if a.get('title') and a.get('title') != '[Removed]']
+        if len(filtered_articles) < len(fetched_articles):
+             logging.info(f"Filtered out {len(fetched_articles) - len(filtered_articles)} articles with missing/removed titles.")
+
+        return filtered_articles
+
+    except Exception as e:
+        # Handle potential API errors (rate limits, invalid queries, connection issues)
+        logging.error(f"Error fetching NewsAPI data for query '{query}': {e}")
+        # Check if the error response is available and log it
+        if hasattr(e, 'response') and e.response is not None:
+             try:
+                 logging.error(f"NewsAPI Response: {e.response.json()}")
+             except: # Handle cases where response is not JSON
+                 logging.error(f"NewsAPI Response Text: {e.response.text}")
+        return [] # Return empty list on error
+
+
+# --- Placeholder for Phase 2 ---
 def scrape_indian_news(ticker):
-    """
-    Placeholder for scraping news for Indian stocks.
-    (Phase 2 Implementation Needed using requests/bs4 or playwright)
-    """
-    logging.info(f"Placeholder: Scraping Indian news for {ticker}")
-    # --- Implementation for Phase 2 ---
-    # headers = {'User-Agent': 'Mozilla/5.0 ...'} # Add a user agent
-    # url = f"https://www.financialnewssite_example.com/search?q={ticker}" # Example URL structure
-    # try:
-    #     response = requests.get(url, headers=headers, timeout=10)
-    #     response.raise_for_status() # Raise error for bad responses (4xx or 5xx)
-    #     soup = BeautifulSoup(response.text, 'html.parser')
-    #     # Find relevant HTML elements containing headlines, links, etc.
-    #     # articles = soup.find_all('div', class_='news-item') # Example selector
-    #     # extracted_data = []
-    #     # for article in articles:
-    #     #     title = article.find('h3').text
-    #     #     link = article.find('a')['href']
-    #     #     # Extract other data...
-    #     #     extracted_data.append({'title': title, 'url': link, ...})
-    #     # return extracted_data
-    # except requests.exceptions.RequestException as e:
-    #     logging.error(f"Error scraping news for {ticker}: {e}")
-    #     return []
-    # -----------------------------------
-    print(f"[Placeholder] Would scrape Indian news for {ticker}")
-    return [] # Return empty list for now
+    """Placeholder for scraping news for Indian stocks."""
+    logging.warning(f"Indian news scraping for {ticker} is not implemented in Phase 1.")
+    return []

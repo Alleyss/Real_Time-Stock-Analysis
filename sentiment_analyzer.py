@@ -1,150 +1,167 @@
 # sentiment_analyzer.py
-from transformers import pipeline
+from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
 import logging
 from config import DEFAULT_SENTIMENT_MODEL
+import torch # Or tensorflow if using TF models
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Placeholder Functions for Phase 0 ---
-# Model loading will be handled in Phase 1/2, likely cached in main.py
+# NOTE: The actual model loading and caching happens in main.py using @st.cache_resource.
+# This file defines the logic that USES the loaded model.
 
-def load_sentiment_model(model_name=DEFAULT_SENTIMENT_MODEL):
+def get_sentiment_pipeline(model_name=DEFAULT_SENTIMENT_MODEL):
     """
-    Loads the sentiment analysis pipeline.
-    (Actual loading should be cached in Streamlit app - Phase 1)
+    Helper function to load the sentiment analysis pipeline.
+    This function itself isn't cached here, but called by the cached function in main.py.
     """
-    logging.info(f"Placeholder: Would load sentiment model '{model_name}'")
-    # --- Implementation for Phase 1 (called & cached in main.py) ---
-    # try:
-    #     sentiment_pipeline = pipeline("sentiment-analysis", model=model_name)
-    #     logging.info(f"Sentiment analysis model '{model_name}' loaded successfully.")
-    #     return sentiment_pipeline
-    # except Exception as e:
-    #     logging.error(f"Error loading sentiment model '{model_name}': {e}")
-    #     return None
-    # ------------------------------------
-    # Return a dummy function for Phase 0 that mimics the pipeline output structure
-    def dummy_pipeline(text):
-        logging.info(f"Dummy sentiment analysis for: '{text[:50]}...'")
-        # Simulate output format: list of dictionaries
-        import random
-        score = random.uniform(0.1, 0.9)
-        label = "POSITIVE" if score > 0.5 else "NEGATIVE"
-        if 0.4 < score < 0.6: label="NEUTRAL" # Add neutral possibility
-        return [{'label': label, 'score': score}]
-    return dummy_pipeline
+    logging.info(f"Attempting to initialize sentiment pipeline with model: {model_name}")
+    try:
+        # Check for GPU availability, use it if possible
+        device = 0 if torch.cuda.is_available() else -1 # 0 for CUDA GPU, -1 for CPU
+        # For TensorFlow: device = 0 if tf.config.list_physical_devices('GPU') else -1
+        logging.info(f"Using device: {'GPU' if device == 0 else 'CPU'}")
+
+        sentiment_pipeline = pipeline(
+            "sentiment-analysis",
+            model=model_name,
+            tokenizer=model_name, # Explicitly pass tokenizer
+            device=device # Specify CPU or GPU
+            # Add truncation=True if headlines might exceed model limits, though less likely for headlines
+        )
+        logging.info(f"Sentiment analysis pipeline loaded successfully for model '{model_name}'.")
+        return sentiment_pipeline
+    except Exception as e:
+        logging.error(f"Error loading sentiment model '{model_name}': {e}", exc_info=True)
+        return None
 
 
-def analyze_sentiment_for_ticker(ticker, news_articles, sentiment_pipeline):
+def analyze_sentiment_for_ticker(news_articles, sentiment_pipeline):
     """
-    Analyzes sentiment for a list of news articles (headlines initially).
-    (Phase 1/2 Implementation Needed)
+    Analyzes sentiment for a list of news articles (headlines initially)
+    using the provided (and cached) sentiment pipeline.
     """
-    logging.info(f"Placeholder: Analyzing sentiment for {ticker} news.")
+    if not news_articles:
+        logging.warning("No news articles provided for sentiment analysis.")
+        return 0.0, [] # Return neutral score and empty details
+
+    if sentiment_pipeline is None:
+        logging.error("Sentiment pipeline is not available. Cannot analyze.")
+        return 0.0, []
+
+    logging.info(f"Analyzing sentiment for {len(news_articles)} articles...")
     analyzed_results = []
-    aggregated_score = 0
-    # --- Implementation for Phase 1/2 ---
-    # total_score = 0.0
-    # relevant_articles = 0
-    # for article in news_articles:
-    #     headline = article.get('title') or article.get('headline') # Handle different key names
-    #     if headline:
-    #         try:
-    #             # Pass headline to the actual pipeline
-    #             result = sentiment_pipeline(headline)[0] # Get the first dict in the list
-    #             score = result['score']
-    #             label = result['label']
-    #             # Convert score to be positive for POSITIVE, negative for NEGATIVE
-    #             if label == 'NEGATIVE':
-    #                 score = -score
-    #             elif label == 'NEUTRAL': # Handle neutral if model provides it
-    #                  score = 0 # Or some small range around 0
-    #             analyzed_results.append({'headline': headline, 'score': score, 'label': label})
-    #             total_score += score
-    #             relevant_articles += 1
-    #         except Exception as e:
-    #             logging.error(f"Error analyzing sentiment for headline '{headline[:50]}...': {e}")
-    # if relevant_articles > 0:
-    #     aggregated_score = total_score / relevant_articles
-    # else:
-    #     aggregated_score = 0
-    # -----------------------------------
-    # Dummy results for Phase 0
-    for i, article in enumerate(news_articles):
-        headline = article.get('title') or article.get('headline', f'Dummy Headline {i+1}')
-        dummy_result = sentiment_pipeline(headline)[0] # Use the dummy pipeline
-        analyzed_results.append({
-            'headline': headline,
-            'score': dummy_result['score'] * (1 if dummy_result['label'] == 'POSITIVE' else -1), # Simple pos/neg conversion
-            'label': dummy_result['label']
-        })
-        aggregated_score += analyzed_results[-1]['score']
+    total_score = 0.0
+    analyzed_count = 0
 
-    final_agg_score = aggregated_score / len(news_articles) if news_articles else 0
-    print(f"[Placeholder] Would analyze sentiment. Aggregated score: {final_agg_score:.2f}")
-    return final_agg_score, analyzed_results # Return score and detailed results
+    headlines = [article.get('title', '') for article in news_articles if article.get('title')]
+    urls = [article.get('url', '') for article in news_articles if article.get('title')] # Keep track of urls
+
+    if not headlines:
+        logging.warning("No valid headlines found in the provided articles.")
+        return 0.0, []
+
+    try:
+        # Process headlines in batches for potentially better performance
+        # The pipeline handles batching internally if you pass a list
+        results = sentiment_pipeline(headlines, truncation=True, max_length=512) # Add truncation
+
+        for i, result in enumerate(results):
+            score = result['score']
+            label = result['label']
+            headline = headlines[i]
+            url = urls[i]
+
+            # --- Score Normalization ---
+            # Convert label/score to a single score in range [-1, 1]
+            # Assumes 'POSITIVE'/'NEGATIVE' labels from distilbert-sst2
+            # Adjust if using a model with different labels (e.g., POSITIVE/NEGATIVE/NEUTRAL or numeric labels)
+            if label == 'POSITIVE':
+                normalized_score = score
+            elif label == 'NEGATIVE':
+                normalized_score = -score
+            else: # Handle potential 'NEUTRAL' or other labels if model changes
+                 logging.warning(f"Unexpected sentiment label '{label}' for model. Treating as neutral (0.0).")
+                 normalized_score = 0.0
+
+            analyzed_results.append({
+                'headline': headline,
+                'url': url, # Include URL for linking
+                'score': normalized_score, # Store the [-1, 1] score
+                'label': label # Store the original label
+            })
+            total_score += normalized_score
+            analyzed_count += 1
+
+    except Exception as e:
+        logging.error(f"Error during batch sentiment analysis: {e}", exc_info=True)
+        # Fallback to individual analysis if batch fails (optional)
+        # ... (implement fallback loop here if needed) ...
+
+    if analyzed_count > 0:
+        aggregated_score = total_score / analyzed_count
+        logging.info(f"Sentiment analysis complete. Aggregated score: {aggregated_score:.4f} from {analyzed_count} articles.")
+    else:
+        aggregated_score = 0.0
+        logging.warning("No articles were successfully analyzed.")
+
+    return aggregated_score, analyzed_results
 
 
 def get_suggestion(aggregated_sentiment_score):
     """
-    Maps aggregated sentiment score to a Buy/Sell/Hold suggestion.
-    (Phase 1 Implementation Needed with refined logic later)
+    Maps aggregated sentiment score to a Buy/Sell/Hold suggestion (5 levels).
     """
-    logging.info(f"Placeholder: Generating suggestion for score {aggregated_sentiment_score:.2f}")
-    # --- Implementation for Phase 1 ---
-    # # Example Thresholds (tune these extensively!)
-    # if aggregated_sentiment_score > 0.6: # Strongly positive
-    #     return "Strong Buy"
-    # elif aggregated_sentiment_score > 0.2: # Positive
-    #     return "Buy"
-    # elif aggregated_sentiment_score > -0.2: # Neutral
-    #     return "Hold"
-    # elif aggregated_sentiment_score > -0.6: # Negative
-    #     return "Sell"
-    # else: # Strongly negative
-    #     return "Strong Sell"
-    # -----------------------------------
-    if aggregated_sentiment_score > 0.1: return "Buy"
-    elif aggregated_sentiment_score < -0.1: return "Sell"
-    else: return "Hold" # Dummy logic
+    logging.info(f"Generating suggestion based on aggregated score: {aggregated_sentiment_score:.4f}")
+    # --- Simple Threshold Logic (Tune these values based on testing!) ---
+    if aggregated_sentiment_score > 0.6:
+        return "Strong Buy"
+    elif aggregated_sentiment_score > 0.2: # Adjusted threshold
+        return "Buy"
+    elif aggregated_sentiment_score >= -0.2: # Adjusted threshold for hold range
+        return "Hold"
+    elif aggregated_sentiment_score >= -0.6:
+        return "Sell"
+    else: # score < -0.6
+        return "Strong Sell"
+
 
 def get_validation_points(analyzed_results):
     """
-    Selects key news headlines to justify the suggestion.
-    (Phase 1 Implementation Needed)
+    Selects key news headlines (most positive/negative) to justify the suggestion.
     """
-    logging.info("Placeholder: Getting validation points.")
-    # --- Implementation for Phase 1 ---
-    # if not analyzed_results:
-    #     return ["No news found to analyze."]
-    #
-    # # Sort by absolute score to find most impactful, or by score for pos/neg separately
-    # sorted_results = sorted(analyzed_results, key=lambda x: x['score'], reverse=True)
-    #
-    # points = []
-    # # Get top positive if available
-    # if sorted_results and sorted_results[0]['score'] > 0:
-    #     points.append(f"Positive driver: {sorted_results[0]['headline']} ({sorted_results[0]['label']}: {sorted_results[0]['score']:.2f})")
-    #
-    # # Get top negative if available (from the end of the sorted list)
-    # if sorted_results and sorted_results[-1]['score'] < 0:
-    #      points.append(f"Negative driver: {sorted_results[-1]['headline']} ({sorted_results[-1]['label']}: {sorted_results[-1]['score']:.2f})")
-    #
-    # # If only one type, maybe take the second most impactful of that type
-    # if len(points) < 2 and len(sorted_results) > 1:
-    #     if sorted_results[0]['score'] > 0 and points[0]['headline'] == sorted_results[0]['headline']: # If top positive was already added
-    #         if sorted_results[1]['score'] > 0: # Add second positive
-    #             points.append(f"Positive driver: {sorted_results[1]['headline']} ({sorted_results[1]['label']}: {sorted_results[1]['score']:.2f})")
-    #     elif sorted_results[-1]['score'] < 0 and points[-1]['headline'] == sorted_results[-1]['headline']: # If top negative was already added
-    #         if len(sorted_results) > 1 and sorted_results[-2]['score'] < 0: # Add second negative
-    #             points.append(f"Negative driver: {sorted_results[-2]['headline']} ({sorted_results[-2]['label']}: {sorted_results[-2]['score']:.2f})")
-    #
-    # return points[:3] # Limit to max 3 points
-    # -----------------------------------
-    if analyzed_results:
-        return [
-            f"• Placeholder validation: {analyzed_results[0]['headline']}",
-            f"• Based on dummy sentiment: {analyzed_results[0]['label']}"
-            ]
-    return ["• No validation points available yet."]
+    if not analyzed_results:
+        logging.info("No analyzed results to generate validation points.")
+        return ["No news data available for justification."]
+
+    # Sort by score: descending for positive, ascending for negative
+    sorted_results = sorted(analyzed_results, key=lambda x: x['score'], reverse=True)
+
+    points = []
+    # Get top positive driver
+    if sorted_results and sorted_results[0]['score'] > 0.05: # Add small threshold to avoid near-zero positives
+        top_pos = sorted_results[0]
+        points.append(f"🟢 **Positive:** [{top_pos['headline']}]({top_pos['url']}) (Score: {top_pos['score']:.2f})")
+
+    # Get top negative driver (from the end of the sorted list)
+    if sorted_results and sorted_results[-1]['score'] < -0.05: # Add small threshold
+        top_neg = sorted_results[-1]
+        # Prepend to list so negative appears first if selling
+        points.insert(0, f"🔴 **Negative:** [{top_neg['headline']}]({top_neg['url']}) (Score: {top_neg['score']:.2f})")
+
+    # If still need more points (e.g., only one strong driver found), add the next most relevant
+    if len(points) < 2 and len(sorted_results) > 1:
+         if points and points[0].startswith("🟢"): # If only positive found, look for second positive
+             if sorted_results[1]['score'] > 0.05:
+                 second_pos = sorted_results[1]
+                 points.append(f"🟢 **Positive:** [{second_pos['headline']}]({second_pos['url']}) (Score: {second_pos['score']:.2f})")
+         elif points and points[0].startswith("🔴"): # If only negative found, look for second negative
+             if sorted_results[-2]['score'] < -0.05:
+                 second_neg = sorted_results[-2]
+                 points.append(f"🔴 **Negative:** [{second_neg['headline']}]({second_neg['url']}) (Score: {second_neg['score']:.2f})")
+
+    if not points:
+         points.append("⚪️ **Neutral:** News sentiment appears balanced or neutral.")
+
+    logging.info(f"Generated {len(points)} validation points.")
+    return points[:3] # Return max 3 points
