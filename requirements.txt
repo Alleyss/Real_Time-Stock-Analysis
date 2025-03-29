@@ -5,5 +5,4 @@ requests
 beautifulsoup4 
 transformers 
 torch 
-torchvision 
-torchaudio
+python-dotenv
