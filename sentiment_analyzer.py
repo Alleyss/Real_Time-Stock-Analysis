@@ -68,7 +68,7 @@ def analyze_sentiment_for_ticker(news_articles, sentiment_pipeline):
 
         for i, result in enumerate(results):
             score = result['score']
-            label = result['label']
+            label = result['label'].lower() # Normalize label to lowercase for consistency
             headline = headlines[i]
             url = urls[i]
 
@@ -76,10 +76,12 @@ def analyze_sentiment_for_ticker(news_articles, sentiment_pipeline):
             # Convert label/score to a single score in range [-1, 1]
             # Assumes 'POSITIVE'/'NEGATIVE' labels from distilbert-sst2
             # Adjust if using a model with different labels (e.g., POSITIVE/NEGATIVE/NEUTRAL or numeric labels)
-            if label == 'POSITIVE':
+            if label == 'positive':
                 normalized_score = score
-            elif label == 'NEGATIVE':
+            elif label == 'negative':
                 normalized_score = -score
+            elif label == 'neutral':
+                normalized_score = 0.0
             else: # Handle potential 'NEUTRAL' or other labels if model changes
                  logging.warning(f"Unexpected sentiment label '{label}' for model. Treating as neutral (0.0).")
                  normalized_score = 0.0
@@ -111,57 +113,72 @@ def analyze_sentiment_for_ticker(news_articles, sentiment_pipeline):
 def get_suggestion(aggregated_sentiment_score):
     """
     Maps aggregated sentiment score to a Buy/Sell/Hold suggestion (5 levels).
+    >>> IMPORTANT: Tune these threshold values based on testing FinBERT results! <<<
     """
     logging.info(f"Generating suggestion based on aggregated score: {aggregated_sentiment_score:.4f}")
-    # --- Simple Threshold Logic (Tune these values based on testing!) ---
-    if aggregated_sentiment_score > 0.6:
+    # --- Example Thresholds (MUST BE ADJUSTED) ---
+    if aggregated_sentiment_score > 0.3: # Example: Lowered threshold for FinBERT?
         return "Strong Buy"
-    elif aggregated_sentiment_score > 0.2: # Adjusted threshold
+    elif aggregated_sentiment_score > 0.1: # Example: Lowered threshold
         return "Buy"
-    elif aggregated_sentiment_score >= -0.2: # Adjusted threshold for hold range
+    elif aggregated_sentiment_score >= -0.1: # Example: Adjusted neutral range
         return "Hold"
-    elif aggregated_sentiment_score >= -0.6:
+    elif aggregated_sentiment_score >= -0.3: # Example: Adjusted threshold
         return "Sell"
-    else: # score < -0.6
+    else: # score < -0.3 (Example)
         return "Strong Sell"
 
-
+# --- Refined get_validation_points ---
 def get_validation_points(analyzed_results):
     """
     Selects key news headlines (most positive/negative) to justify the suggestion.
+    Includes labels in output and handles neutral case slightly better.
     """
     if not analyzed_results:
         logging.info("No analyzed results to generate validation points.")
-        return ["No news data available for justification."]
+        return ["⚪️ No news data available for justification."] # Use neutral emoji
 
     # Sort by score: descending for positive, ascending for negative
     sorted_results = sorted(analyzed_results, key=lambda x: x['score'], reverse=True)
 
     points = []
+    # Define score thresholds for "significant" sentiment
+    POSITIVE_THRESHOLD = 0.05
+    NEGATIVE_THRESHOLD = -0.05
+
     # Get top positive driver
-    if sorted_results and sorted_results[0]['score'] > 0.05: # Add small threshold to avoid near-zero positives
+    if sorted_results and sorted_results[0]['score'] > POSITIVE_THRESHOLD:
         top_pos = sorted_results[0]
-        points.append(f"🟢 **Positive:** [{top_pos['headline']}]({top_pos['url']}) (Score: {top_pos['score']:.2f})")
+        # Include the label for clarity
+        points.append(f"🟢 **Positive:** [{top_pos['headline']}]({top_pos['url']}) (Score: {top_pos['score']:.2f}, Label: {top_pos['label']})")
 
     # Get top negative driver (from the end of the sorted list)
-    if sorted_results and sorted_results[-1]['score'] < -0.05: # Add small threshold
+    if sorted_results and sorted_results[-1]['score'] < NEGATIVE_THRESHOLD:
         top_neg = sorted_results[-1]
-        # Prepend to list so negative appears first if selling
-        points.insert(0, f"🔴 **Negative:** [{top_neg['headline']}]({top_neg['url']}) (Score: {top_neg['score']:.2f})")
+        # Include the label for clarity
+        # Prepend negative to list if selling suggestions are common
+        points.insert(0, f"🔴 **Negative:** [{top_neg['headline']}]({top_neg['url']}) (Score: {top_neg['score']:.2f}, Label: {top_neg['label']})")
 
     # If still need more points (e.g., only one strong driver found), add the next most relevant
     if len(points) < 2 and len(sorted_results) > 1:
          if points and points[0].startswith("🟢"): # If only positive found, look for second positive
-             if sorted_results[1]['score'] > 0.05:
+             if sorted_results[1]['score'] > POSITIVE_THRESHOLD:
                  second_pos = sorted_results[1]
-                 points.append(f"🟢 **Positive:** [{second_pos['headline']}]({second_pos['url']}) (Score: {second_pos['score']:.2f})")
+                 points.append(f"🟢 **Positive:** [{second_pos['headline']}]({second_pos['url']}) (Score: {second_pos['score']:.2f}, Label: {second_pos['label']})")
          elif points and points[0].startswith("🔴"): # If only negative found, look for second negative
-             if sorted_results[-2]['score'] < -0.05:
+             if sorted_results[-2]['score'] < NEGATIVE_THRESHOLD:
                  second_neg = sorted_results[-2]
-                 points.append(f"🔴 **Negative:** [{second_neg['headline']}]({second_neg['url']}) (Score: {second_neg['score']:.2f})")
+                 points.append(f"🔴 **Negative:** [{second_neg['headline']}]({second_neg['url']}) (Score: {second_neg['score']:.2f}, Label: {second_neg['label']})")
 
+    # Handle case where no significant positive or negative points were found
     if not points:
-         points.append("⚪️ **Neutral:** News sentiment appears balanced or neutral.")
+         # Find the article closest to 0 score (most neutral)
+         closest_neutral = min(analyzed_results, key=lambda x: abs(x['score']), default=None)
+         if closest_neutral:
+              points.append(f"⚪️ **Neutral:** [{closest_neutral['headline']}]({closest_neutral['url']}) (Score: {closest_neutral['score']:.2f}, Label: {closest_neutral['label']})")
+         else: # Should not happen if analyzed_results is not empty, but safeguard
+              points.append("⚪️ **Neutral:** News sentiment appears balanced.")
+
 
     logging.info(f"Generated {len(points)} validation points.")
     return points[:3] # Return max 3 points

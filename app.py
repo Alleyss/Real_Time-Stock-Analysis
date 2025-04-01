@@ -156,7 +156,7 @@ if analyze_button and ticker_input:
                  news_display = []
                  for item in analyzed_details:
                      # Simple display for MVP
-                     label_emoji = "🟢" if item['label'] == 'POSITIVE' else "🔴" if item['label'] == 'NEGATIVE' else "⚪️"
+                     label_emoji = "🟢" if item['label'] == 'positive' else "🔴" if item['label'] == 'negative' else "⚪️"
                      news_display.append(f"{label_emoji} [{item['headline']}]({item['url']})")
 
                  if news_display:
