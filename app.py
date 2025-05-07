@@ -1,26 +1,22 @@
-# main.py (Streamlit Application)
+# app.py (Streamlit Application)
 import streamlit as st
 import logging
-import pandas as pd # For potential dataframe display
-from datetime import datetime, timedelta
-
-# Import functions from other modules
-from config import DEFAULT_SENTIMENT_MODEL
-from database import create_tables, save_stock_info, save_news_articles,update_article_sentiment
-from data_fetcher import get_stock_info, get_us_news, scrape_indian_news
+# Ensure all necessary imports from config are present if used directly in this file
+from config import DEFAULT_SENTIMENT_MODEL, RECENCY_DECAY_HALF_LIFE_HOURS, INTENSITY_BOOST_FACTOR
+from database import create_tables, save_stock_info, save_content_items, update_sentiment_for_items
+from data_fetcher import get_stock_info, get_us_news, fetch_reddit_data,  scrape_indian_news # scrape_indian_news is placeholder
 from sentiment_analyzer import (
-    get_sentiment_pipeline, # Import the loader helper
+    get_sentiment_pipeline,
     analyze_sentiment_for_ticker,
-    
+    calculate_weighted_sentiment,
     get_suggestion,
     get_validation_points
 )
 
 # --- Basic Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
 # --- Database Initialization ---
-# Run this once when the script starts to ensure tables exist
 try:
     logging.info("Initializing database schema...")
     create_tables()
@@ -28,13 +24,11 @@ try:
 except Exception as e:
     st.error(f"Fatal Error: Failed to initialize database: {e}")
     logging.error(f"Database initialization failed: {e}", exc_info=True)
-    st.stop() # Stop the app if DB setup fails
+    st.stop()
 
 # --- Model Loading (Cached) ---
-# Use Streamlit's caching to load the model only once
-@st.cache_resource # Caches the actual pipeline object
+@st.cache_resource
 def load_model(model_name=DEFAULT_SENTIMENT_MODEL):
-    """Loads and caches the sentiment analysis pipeline."""
     logging.info(f"Attempting to load/cache sentiment model: {model_name}")
     pipeline_instance = get_sentiment_pipeline(model_name)
     if pipeline_instance is None:
@@ -43,147 +37,211 @@ def load_model(model_name=DEFAULT_SENTIMENT_MODEL):
 
 sentiment_pipeline = load_model()
 
-# Check if model loading failed after attempting to cache
 if sentiment_pipeline is None:
-     st.error(f"Fatal Error: Failed to load sentiment model '{DEFAULT_SENTIMENT_MODEL}'. Cannot perform analysis.")
-     logging.critical(f"Sentiment model '{DEFAULT_SENTIMENT_MODEL}' failed to load. Application might not function correctly.")
-     st.stop() # Stop if model is essential and failed loading
+     st.error(f"Fatal Error: Failed to load sentiment model '{DEFAULT_SENTIMENT_MODEL}'. Check logs. Analysis disabled.")
+     logging.critical(f"Sentiment model '{DEFAULT_SENTIMENT_MODEL}' failed to load.")
+     st.stop()
 
-# --- Streamlit App Layout ---
+# --- UI Helper ---
+def display_analysis_output(stock_data, company_name_disp, ticker_disp,
+                            final_weighted_score, analyzed_details_disp, suggestion_disp,
+                            validation_points_disp, source_desc):
+    st.subheader(f"Results for {company_name_disp} ({ticker_disp}) from {source_desc}")
+    
+    try:
+        score_val = float(final_weighted_score)
+    except (ValueError, TypeError):
+        score_val = 0.0
+        st.warning("Could not determine a valid final sentiment score.")
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if stock_data:
+            price = stock_data.get('current_price', 'N/A')
+            price_str = f"${price:.2f}" if isinstance(price, (int, float)) else "N/A"
+            st.metric(label="Last Price", value=price_str)
+            st.markdown(f"**Sector:** {stock_data.get('info', {}).get('sector', 'N/A')}")
+            st.markdown(f"**Industry:** {stock_data.get('info', {}).get('industry', 'N/A')}")
+
+        st.markdown("---")
+        st.subheader("AI Suggestion:")
+        st.caption(f"(Based on {source_desc.lower()} content analysis)")
+        score_display = f"(Score: {score_val:.3f})"
+        
+        if suggestion_disp == "Strong Buy": st.success(f"**{suggestion_disp}** {score_display}")
+        elif suggestion_disp == "Buy": st.success(f"**{suggestion_disp}** {score_display}")
+        elif suggestion_disp == "Hold": st.info(f"**{suggestion_disp}** {score_display}")
+        elif suggestion_disp == "Sell": st.error(f"**{suggestion_disp}** {score_display}")
+        elif suggestion_disp == "Strong Sell": st.error(f"**{suggestion_disp}** {score_display}")
+        else: st.write(f"{suggestion_disp} {score_display}")
+
+        st.markdown("**Justification based on content:**")
+        if validation_points_disp:
+            for point in validation_points_disp:
+                st.markdown(point, unsafe_allow_html=True)
+        else:
+            st.write("Sentiment appears balanced or lacks strong drivers for justification.")
+
+    with col2:
+        st.subheader(f"Top {source_desc} Content Analyzed:")
+        if analyzed_details_disp:
+            display_items = []
+            # Sort details by recency before displaying if publishedAt is reliable
+            # For now, just take the first 15 as returned by sentiment_analyzer
+            for item in analyzed_details_disp[:15]:
+                emoji = "🟢" if item['label'] == 'positive' else "🔴" if item['label'] == 'negative' else "⚪️"
+                display_items.append(f"{emoji} [{item.get('headline','No Headline')}]({item.get('url','#')}) - *{item.get('source_name','Unknown')}* (Score: {item.get('score',0):.2f})")
+            if display_items:
+                st.markdown("\n".join(f"- {line}" for line in display_items), unsafe_allow_html=True)
+            else:
+                st.write("No content details to display.")
+        else:
+            st.write(f"No {source_desc.lower()} content was found or processed successfully.")
+
+# --- App Layout ---
 st.set_page_config(layout="wide")
-st.title("📊 Real-Time Stock Analysis using Sentiment (MVP)")
-st.caption("Enter a US stock ticker (e.g., AAPL, MSFT, GOOG) to get sentiment analysis based on recent news.")
+st.title("📊 Multi-Source Stock Sentiment Analyzer (MVP)")
+st.caption("Enter a US stock ticker and choose a data source for sentiment analysis.")
 
-# --- Input Section ---
-ticker_input = st.text_input("Enter US Stock Ticker:", "AAPL").upper()
-analyze_button = st.button("Analyze Sentiment ✨")
+ticker_input = st.text_input("Enter US Stock Ticker:", "AAPL").upper() # Default to AAPL for example
+st.markdown("---")
 
-# --- Analysis Execution ---
-if analyze_button and ticker_input:
-    with st.spinner(f"Analyzing {ticker_input}... Fetching data and running analysis..."):
-        analysis_successful = False
-        try:
-            # 1. Fetch Stock Info (Error handled in function)
-            logging.info(f"[Workflow] Fetching stock info for {ticker_input}")
-            stock_data = get_stock_info(ticker_input)
-            if not stock_data:
-                st.error(f"Could not retrieve valid stock information for {ticker_input}. Please check the ticker.")
-                st.stop() # Stop processing if basic info fails
+# Session state for results
+if 'analysis_data' not in st.session_state:
+    st.session_state.analysis_data = None
 
-            company_name = stock_data.get("company_name", ticker_input)
+# --- Generic Analysis Function (Corrected) ---
+def perform_analysis(fetch_function_to_call, current_ticker_sym, current_company_name, source_description_name, **additional_fetch_kwargs):
+    """
+    Performs fetching, analysis, and DB operations for a given data source.
+    Args:
+        fetch_function_to_call: The data fetching function (e.g., get_us_news).
+        current_ticker_sym: The stock ticker symbol.
+        current_company_name: The company name.
+        source_description_name: String describing the source (e.g., "News", "Reddit").
+        **additional_fetch_kwargs: Additional keyword arguments for the fetch_function_to_call.
+    """
+    st.session_state.analysis_data = None # Clear previous results for a new analysis run
+    
+    fetched_content = []
+    with st.spinner(f"Fetching {source_description_name} data for {current_ticker_sym}..."):
+        # CORRECTED CALL to fetch_function_to_call:
+        # Pass ticker_symbol and company_name as keyword arguments.
+        fetched_content = fetch_function_to_call(
+            ticker_symbol=current_ticker_sym,
+            company_name=current_company_name,
+            **additional_fetch_kwargs # Pass along any other specific args (like articles_count for news)
+        )
 
-            # (Optional but good practice) Save/Update stock info in DB
-            save_stock_info(ticker_input, company_name)
+    if not fetched_content:
+        st.warning(f"No relevant {source_description_name} content found for {current_ticker_sym} / {current_company_name}.")
+        return None # Indicate failure
 
-            # 2. Fetch News (US Only for Phase 1)
-            logging.info(f"[Workflow] Fetching US news for {company_name} (query based on ticker/name)")
-            # Use company name for better query results if available
-            news_articles = get_us_news(company_name)
+    saved_db_count = save_content_items(current_ticker_sym, fetched_content)
+    # Logging of saved_db_count is now handled within save_content_items or its sub-functions
 
-            if not news_articles:
-                st.warning(f"No recent news articles found for {company_name} ({ticker_input}) via NewsAPI. Sentiment analysis may be based on limited data or unavailable.")
-                # Decide if you want to stop or proceed with score 0
-                # For MVP, let's proceed but it will likely result in 'Hold'
-                aggregated_score = 0.0
-                analyzed_details = []
-            else:
-                # 3. (Optional) Save Fetched News Articles to DB
-                logging.info(f"[Workflow] Saving {len(news_articles)} fetched articles to database.")
-                save_news_articles(ticker_input, news_articles)
+    analyzed_item_details = []
+    with st.spinner(f"Analyzing {source_description_name} sentiment for {current_ticker_sym}..."):
+        analyzed_item_details = analyze_sentiment_for_ticker(fetched_content, sentiment_pipeline)
 
-                # 4. Analyze Sentiment
-                logging.info(f"[Workflow] Running sentiment analysis...")
-                aggregated_score, analyzed_details = analyze_sentiment_for_ticker(news_articles, sentiment_pipeline)
-                # 5. <<< Update Database with Sentiment >>>
-                if analyzed_details: # Only update if analysis produced results
-                     logging.info(f"[Workflow] Updating database with sentiment scores for {len(analyzed_details)} articles.")
-                     update_article_sentiment(analyzed_details) # Call the new function
-                else:
-                     logging.warning("[Workflow] No analysis details generated, skipping sentiment update in DB.")
-            # 6. Get Suggestion
-            logging.info(f"[Workflow] Generating suggestion...")
-            suggestion = get_suggestion(aggregated_score)
+    if not analyzed_item_details:
+        st.warning(f"Sentiment analysis failed to produce results for {source_description_name} content.")
+        return None
 
-            # 7. Get Validation Points
-            logging.info(f"[Workflow] Extracting validation points...")
-            validation_points = get_validation_points(analyzed_details) # Pass detailed results
+    updated_db_sentiment_count = update_sentiment_for_items(analyzed_item_details)
+    # Logging of updated_db_sentiment_count is now handled within update_sentiment_for_items
 
-            analysis_successful = True # Mark as successful if we got this far
+    final_weighted_score_for_source = calculate_weighted_sentiment(
+        analyzed_item_details,
+        RECENCY_DECAY_HALF_LIFE_HOURS,
+        INTENSITY_BOOST_FACTOR
+    )
 
-        except Exception as e:
-            st.error(f"An unexpected error occurred during the analysis process for {ticker_input}:")
-            st.exception(e) # Show detailed error in Streamlit app for debugging
-            logging.error(f"Analysis workflow failed for {ticker_input}: {e}", exc_info=True)
+    current_suggestion = get_suggestion(final_weighted_score_for_source)
+    current_validation_points = get_validation_points(analyzed_item_details)
 
-    # --- Display Results (Only if analysis was attempted) ---
-    if 'stock_data' in locals() and stock_data: # Check if stock_data was fetched
-        st.subheader(f"Analysis Results for {company_name} ({ticker_input})")
-        col1, col2 = st.columns([1, 2]) # Adjust ratio as needed
+    logging.info(f"[{source_description_name.upper()}_LOG] Ticker: {current_ticker_sym}, Final Score: {final_weighted_score_for_source:.4f}, Items: {len(analyzed_item_details)}")
 
-        with col1:
-            # Display Stock Price and Info
-            current_price = stock_data.get('current_price', 'N/A')
-            price_display = f"${current_price:.2f}" if isinstance(current_price, (int, float)) else "N/A"
-            st.metric(label="Last Price", value=price_display)
+    # Store results in session state for display
+    # Note: 'ticker' and 'company_name' in this dict are the ones used for THIS analysis run.
+    analysis_result_dict = {
+        'final_score': final_weighted_score_for_source,
+        'analyzed_details': analyzed_item_details,
+        'suggestion': current_suggestion,
+        'validation_points': current_validation_points,
+        'source_description': source_description_name,
+        'ticker': current_ticker_sym,
+        'company_name': current_company_name
+    }
+    st.session_state.analysis_data = analysis_result_dict
+    return analysis_result_dict # Also return for direct use if needed
 
-            # Add other key info if available
-            info = stock_data.get('info', {})
-            st.markdown(f"**Sector:** {info.get('sector', 'N/A')}")
-            st.markdown(f"**Industry:** {info.get('industry', 'N/A')}")
-            market_cap = info.get('marketCap')
-            if market_cap:
-                 st.markdown(f"**Market Cap:** ${market_cap:,}") # Format with commas
+# --- Buttons for different sources ---
+col_buttons1, col_buttons2 = st.columns(2)
+analysis_was_triggered_this_run = False # To help with initial message display
 
-            # Display Suggestion and Validation (if analysis ran)
-            if analysis_successful:
-                 st.markdown("---")
-                 st.subheader("AI Suggestion:")
-                 score_display = f"(Score: {aggregated_score:.3f})"
-                 if suggestion == "Strong Buy": st.success(f"**{suggestion}** {score_display}")
-                 elif suggestion == "Buy": st.success(f"**{suggestion}** {score_display}")
-                 elif suggestion == "Hold": st.info(f"**{suggestion}** {score_display}")
-                 elif suggestion == "Sell": st.error(f"**{suggestion}** {score_display}")
-                 elif suggestion == "Strong Sell": st.error(f"**{suggestion}** {score_display}")
+# Global variables to store fetched stock info for the current ticker
+# These are fetched once if any analysis button is pressed.
+g_stock_data = None
+g_company_name = ticker_input # Default to ticker_input if stock info fetch fails
 
-                 st.markdown("**Justification based on news:**")
-                 if validation_points:
-                     for point in validation_points:
-                         st.markdown(point, unsafe_allow_html=True) # Allow markdown links
-                 else:
-                      st.write("Could not extract specific validation points.")
-            elif not analysis_successful and 'aggregated_score' not in locals():
-                 # Handle case where analysis block failed before setting score
-                 st.warning("Analysis could not be completed due to an error.")
+if ticker_input: # Only attempt to get stock info if a ticker is provided
+    # This get_stock_info is cached by Streamlit if called with the same ticker
+    g_stock_data = get_stock_info(ticker_input)
+    if g_stock_data:
+        g_company_name = g_stock_data.get("company_name", ticker_input)
+        # Save/update stock info in DB (idempotent operation)
+        save_stock_info(ticker_input, g_company_name)
+    else:
+        # Display error only once if it persists, not on every Streamlit rerun without button press
+        if 'stock_info_error_shown' not in st.session_state or st.session_state.stock_info_error_ticker != ticker_input:
+            st.error(f"Could not retrieve fundamental stock information for {ticker_input}. Please check the ticker. Analysis buttons disabled.")
+            st.session_state.stock_info_error_shown = True
+            st.session_state.stock_info_error_ticker = ticker_input
+        # Keep g_stock_data as None, buttons will be disabled.
+elif 'stock_info_error_shown' in st.session_state: # Clear error if ticker input is cleared
+    del st.session_state.stock_info_error_shown
+    if 'stock_info_error_ticker' in st.session_state:
+        del st.session_state.stock_info_error_ticker
 
-        with col2:
-            st.subheader("Recent News Headlines Analyzed:")
-            if analysis_successful and analyzed_details:
-                 # Create a small dataframe for better display? Or just list.
-                 news_display = []
-                 for item in analyzed_details:
-                     # Simple display for MVP
-                     label_emoji = "🟢" if item['label'] == 'positive' else "🔴" if item['label'] == 'negative' else "⚪️"
-                     news_display.append(f"{label_emoji} [{item['headline']}]({item['url']})")
 
-                 if news_display:
-                     st.markdown("\n".join(f"- {line}" for line in news_display), unsafe_allow_html=True)
-                 else:
-                      st.write("No headlines were successfully analyzed.")
+# --- Button Logic ---
+# The `disabled` state of buttons now depends on `g_stock_data` being successfully fetched.
+with col_buttons1:
+    if st.button("Analyze News Sentiment 📰", key="news_btn", use_container_width=True, disabled=not g_stock_data):
+        if ticker_input and g_stock_data: # Double check, though disabled should prevent
+            perform_analysis(get_us_news, ticker_input, g_company_name, "News") # articles_count will use default from get_us_news
+            analysis_was_triggered_this_run = True
+        elif not ticker_input: st.warning("Please enter a stock ticker.")
+        # else: g_stock_data was None, button was disabled, this branch shouldn't be hit.
+with col_buttons2:
+    if st.button("Analyze Reddit Sentiment 👽", key="reddit_btn", use_container_width=True, disabled=not g_stock_data):
+        if ticker_input and g_stock_data:
+            perform_analysis(fetch_reddit_data, ticker_input, g_company_name, "Reddit")
+            analysis_was_triggered_this_run = True
+        elif not ticker_input: st.warning("Please enter a stock ticker.")
 
-            elif 'news_articles' in locals() and news_articles:
-                 # Display fetched headlines even if analysis part failed
-                 st.write("(Displaying fetched headlines as analysis may have failed)")
-                 for article in news_articles:
-                      st.markdown(f"- [{article.get('title', 'No Title')}]({article.get('url', '#')}) ({article.get('source',{}).get('name', 'Unknown Source')})")
-            else:
-                 st.write("No news headlines were found or processed.")
+st.markdown("---")
 
-elif not ticker_input and analyze_button:
-    st.warning("Please enter a stock ticker.")
-else:
-    # Initial state message
-    st.info("Enter a US stock ticker and click 'Analyze Sentiment ✨'.")
+# --- Display results from session state ---
+if st.session_state.analysis_data:
+    res = st.session_state.analysis_data
+    # Use g_stock_data if available (it should be if analysis ran successfully for the current ticker)
+    # The 'ticker' and 'company_name' in 'res' are from the analysis run.
+    # g_stock_data is for the *current* ticker_input.
+    stock_data_for_display = g_stock_data if g_stock_data and res['ticker'] == ticker_input else get_stock_info(res['ticker'])
+
+    display_analysis_output(
+        stock_data_for_display, res['company_name'], res['ticker'],
+        res['final_score'], res['analyzed_details'],
+        res['suggestion'], res['validation_points'], res['source_description']
+    )
+elif not analysis_was_triggered_this_run and not any(st.session_state.get(f"{key}_btn_was_clicked", False) for key in ["news", "reddit"]):
+    # A more robust check if any analysis button was *ever* clicked could involve storing a flag in session_state on button press
+    st.info("Enter a stock ticker and select a data source (News, Reddit) to analyze sentiment.")
+    # To make the above condition more robust:
+    # At the end of each button's if block, set st.session_state[f"{source}_btn_was_clicked"] = True
 
 # --- Footer ---
 st.markdown("---")
-st.caption("Disclaimer: This tool provides AI-generated sentiment analysis based on public news data for informational purposes only. It is NOT financial advice. Verify information and conduct your own research before making any investment decisions.")
+st.caption("Disclaimer: This tool provides AI-generated sentiment analysis based on public data for informational purposes only. It is NOT financial advice. Verify information and conduct your own research before making any investment decisions.")

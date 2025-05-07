@@ -8,4 +8,9 @@ torch
 python-dotenv
 newspaper3k
 praw 
-snscrape
+fastapi 
+"uvicorn[standard]" 
+pydantic[email] 
+python-jose[cryptography] 
+passlib[bcrypt] 
+psycopg2-binary

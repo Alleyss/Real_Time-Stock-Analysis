@@ -1,26 +1,23 @@
 **app.py**
-# main.py (Streamlit Application)
+# app.py (Streamlit Application)
 import streamlit as st
 import logging
-import pandas as pd # For potential dataframe display
-from datetime import datetime, timedelta
-
-# Import functions from other modules
-from config import DEFAULT_SENTIMENT_MODEL
-from database import create_tables, save_stock_info, save_news_articles
-from data_fetcher import get_stock_info, get_us_news, scrape_indian_news
+# Ensure all necessary imports from config are present if used directly in this file
+from config import DEFAULT_SENTIMENT_MODEL, RECENCY_DECAY_HALF_LIFE_HOURS, INTENSITY_BOOST_FACTOR
+from database import create_tables, save_stock_info, save_content_items, update_sentiment_for_items
+from data_fetcher import get_stock_info, get_us_news, fetch_reddit_data,  scrape_indian_news # scrape_indian_news is placeholder
 from sentiment_analyzer import (
-    get_sentiment_pipeline, # Import the loader helper
+    get_sentiment_pipeline,
     analyze_sentiment_for_ticker,
+    calculate_weighted_sentiment,
     get_suggestion,
     get_validation_points
 )
 
 # --- Basic Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
 # --- Database Initialization ---
-# Run this once when the script starts to ensure tables exist
 try:
     logging.info("Initializing database schema...")
     create_tables()
@@ -28,13 +25,11 @@ try:
 except Exception as e:
     st.error(f"Fatal Error: Failed to initialize database: {e}")
     logging.error(f"Database initialization failed: {e}", exc_info=True)
-    st.stop() # Stop the app if DB setup fails
+    st.stop()
 
 # --- Model Loading (Cached) ---
-# Use Streamlit's caching to load the model only once
-@st.cache_resource # Caches the actual pipeline object
+@st.cache_resource
 def load_model(model_name=DEFAULT_SENTIMENT_MODEL):
-    """Loads and caches the sentiment analysis pipeline."""
     logging.info(f"Attempting to load/cache sentiment model: {model_name}")
     pipeline_instance = get_sentiment_pipeline(model_name)
     if pipeline_instance is None:
@@ -43,147 +38,788 @@ def load_model(model_name=DEFAULT_SENTIMENT_MODEL):
 
 sentiment_pipeline = load_model()
 
-# Check if model loading failed after attempting to cache
 if sentiment_pipeline is None:
-     st.error(f"Fatal Error: Failed to load sentiment model '{DEFAULT_SENTIMENT_MODEL}'. Cannot perform analysis.")
-     logging.critical(f"Sentiment model '{DEFAULT_SENTIMENT_MODEL}' failed to load. Application might not function correctly.")
-     st.stop() # Stop if model is essential and failed loading
+     st.error(f"Fatal Error: Failed to load sentiment model '{DEFAULT_SENTIMENT_MODEL}'. Check logs. Analysis disabled.")
+     logging.critical(f"Sentiment model '{DEFAULT_SENTIMENT_MODEL}' failed to load.")
+     st.stop()
 
-# --- Streamlit App Layout ---
+# --- UI Helper ---
+def display_analysis_output(stock_data, company_name_disp, ticker_disp,
+                            final_weighted_score, analyzed_details_disp, suggestion_disp,
+                            validation_points_disp, source_desc):
+    st.subheader(f"Results for {company_name_disp} ({ticker_disp}) from {source_desc}")
+    
+    try:
+        score_val = float(final_weighted_score)
+    except (ValueError, TypeError):
+        score_val = 0.0
+        st.warning("Could not determine a valid final sentiment score.")
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if stock_data:
+            price = stock_data.get('current_price', 'N/A')
+            price_str = f"${price:.2f}" if isinstance(price, (int, float)) else "N/A"
+            st.metric(label="Last Price", value=price_str)
+            st.markdown(f"**Sector:** {stock_data.get('info', {}).get('sector', 'N/A')}")
+            st.markdown(f"**Industry:** {stock_data.get('info', {}).get('industry', 'N/A')}")
+
+        st.markdown("---")
+        st.subheader("AI Suggestion:")
+        st.caption(f"(Based on {source_desc.lower()} content analysis)")
+        score_display = f"(Score: {score_val:.3f})"
+        
+        if suggestion_disp == "Strong Buy": st.success(f"**{suggestion_disp}** {score_display}")
+        elif suggestion_disp == "Buy": st.success(f"**{suggestion_disp}** {score_display}")
+        elif suggestion_disp == "Hold": st.info(f"**{suggestion_disp}** {score_display}")
+        elif suggestion_disp == "Sell": st.error(f"**{suggestion_disp}** {score_display}")
+        elif suggestion_disp == "Strong Sell": st.error(f"**{suggestion_disp}** {score_display}")
+        else: st.write(f"{suggestion_disp} {score_display}")
+
+        st.markdown("**Justification based on content:**")
+        if validation_points_disp:
+            for point in validation_points_disp:
+                st.markdown(point, unsafe_allow_html=True)
+        else:
+            st.write("Sentiment appears balanced or lacks strong drivers for justification.")
+
+    with col2:
+        st.subheader(f"Top {source_desc} Content Analyzed:")
+        if analyzed_details_disp:
+            display_items = []
+            # Sort details by recency before displaying if publishedAt is reliable
+            # For now, just take the first 15 as returned by sentiment_analyzer
+            for item in analyzed_details_disp[:15]:
+                emoji = "🟢" if item['label'] == 'positive' else "🔴" if item['label'] == 'negative' else "⚪️"
+                display_items.append(f"{emoji} [{item.get('headline','No Headline')}]({item.get('url','#')}) - *{item.get('source_name','Unknown')}* (Score: {item.get('score',0):.2f})")
+            if display_items:
+                st.markdown("\n".join(f"- {line}" for line in display_items), unsafe_allow_html=True)
+            else:
+                st.write("No content details to display.")
+        else:
+            st.write(f"No {source_desc.lower()} content was found or processed successfully.")
+
+# --- App Layout ---
 st.set_page_config(layout="wide")
-st.title("📊 Real-Time Stock Analysis using Sentiment (MVP)")
-st.caption("Enter a US stock ticker (e.g., AAPL, MSFT, GOOG) to get sentiment analysis based on recent news.")
+st.title("📊 Multi-Source Stock Sentiment Analyzer (MVP)")
+st.caption("Enter a US stock ticker and choose a data source for sentiment analysis.")
 
-# --- Input Section ---
-ticker_input = st.text_input("Enter US Stock Ticker:", "AAPL").upper()
-analyze_button = st.button("Analyze Sentiment ✨")
+ticker_input = st.text_input("Enter US Stock Ticker:", "AAPL").upper() # Default to AAPL for example
+st.markdown("---")
 
-# --- Analysis Execution ---
-if analyze_button and ticker_input:
-    with st.spinner(f"Analyzing {ticker_input}... Fetching data and running analysis..."):
-        analysis_successful = False
-        try:
-            # 1. Fetch Stock Info (Error handled in function)
-            logging.info(f"[Workflow] Fetching stock info for {ticker_input}")
-            stock_data = get_stock_info(ticker_input)
-            if not stock_data:
-                st.error(f"Could not retrieve valid stock information for {ticker_input}. Please check the ticker.")
-                st.stop() # Stop processing if basic info fails
+# Session state for results
+if 'analysis_data' not in st.session_state:
+    st.session_state.analysis_data = None
 
-            company_name = stock_data.get("company_name", ticker_input)
+# --- Generic Analysis Function (Corrected) ---
+def perform_analysis(fetch_function_to_call, current_ticker_sym, current_company_name, source_description_name, **additional_fetch_kwargs):
+    """
+    Performs fetching, analysis, and DB operations for a given data source.
+    Args:
+        fetch_function_to_call: The data fetching function (e.g., get_us_news).
+        current_ticker_sym: The stock ticker symbol.
+        current_company_name: The company name.
+        source_description_name: String describing the source (e.g., "News", "Reddit").
+        **additional_fetch_kwargs: Additional keyword arguments for the fetch_function_to_call.
+    """
+    st.session_state.analysis_data = None # Clear previous results for a new analysis run
+    
+    fetched_content = []
+    with st.spinner(f"Fetching {source_description_name} data for {current_ticker_sym}..."):
+        # CORRECTED CALL to fetch_function_to_call:
+        # Pass ticker_symbol and company_name as keyword arguments.
+        fetched_content = fetch_function_to_call(
+            ticker_symbol=current_ticker_sym,
+            company_name=current_company_name,
+            **additional_fetch_kwargs # Pass along any other specific args (like articles_count for news)
+        )
 
-            # (Optional but good practice) Save/Update stock info in DB
-            save_stock_info(ticker_input, company_name)
+    if not fetched_content:
+        st.warning(f"No relevant {source_description_name} content found for {current_ticker_sym} / {current_company_name}.")
+        return None # Indicate failure
 
-            # 2. Fetch News (US Only for Phase 1)
-            logging.info(f"[Workflow] Fetching US news for {company_name} (query based on ticker/name)")
-            # Use company name for better query results if available
-            news_articles = get_us_news(company_name)
+    saved_db_count = save_content_items(current_ticker_sym, fetched_content)
+    # Logging of saved_db_count is now handled within save_content_items or its sub-functions
 
-            if not news_articles:
-                st.warning(f"No recent news articles found for {company_name} ({ticker_input}) via NewsAPI. Sentiment analysis may be based on limited data or unavailable.")
-                # Decide if you want to stop or proceed with score 0
-                # For MVP, let's proceed but it will likely result in 'Hold'
-                aggregated_score = 0.0
-                analyzed_details = []
-            else:
-                # 3. (Optional) Save Fetched News Articles to DB
-                logging.info(f"[Workflow] Saving {len(news_articles)} fetched articles to database.")
-                save_news_articles(ticker_input, news_articles)
+    analyzed_item_details = []
+    with st.spinner(f"Analyzing {source_description_name} sentiment for {current_ticker_sym}..."):
+        analyzed_item_details = analyze_sentiment_for_ticker(fetched_content, sentiment_pipeline)
 
-                # 4. Analyze Sentiment
-                logging.info(f"[Workflow] Running sentiment analysis...")
-                aggregated_score, analyzed_details = analyze_sentiment_for_ticker(news_articles, sentiment_pipeline)
+    if not analyzed_item_details:
+        st.warning(f"Sentiment analysis failed to produce results for {source_description_name} content.")
+        return None
 
-            # 5. Get Suggestion
-            logging.info(f"[Workflow] Generating suggestion...")
-            suggestion = get_suggestion(aggregated_score)
+    updated_db_sentiment_count = update_sentiment_for_items(analyzed_item_details)
+    # Logging of updated_db_sentiment_count is now handled within update_sentiment_for_items
 
-            # 6. Get Validation Points
-            logging.info(f"[Workflow] Extracting validation points...")
-            validation_points = get_validation_points(analyzed_details) # Pass detailed results
+    final_weighted_score_for_source = calculate_weighted_sentiment(
+        analyzed_item_details,
+        RECENCY_DECAY_HALF_LIFE_HOURS,
+        INTENSITY_BOOST_FACTOR
+    )
 
-            analysis_successful = True # Mark as successful if we got this far
+    current_suggestion = get_suggestion(final_weighted_score_for_source)
+    current_validation_points = get_validation_points(analyzed_item_details)
 
-        except Exception as e:
-            st.error(f"An unexpected error occurred during the analysis process for {ticker_input}:")
-            st.exception(e) # Show detailed error in Streamlit app for debugging
-            logging.error(f"Analysis workflow failed for {ticker_input}: {e}", exc_info=True)
+    logging.info(f"[{source_description_name.upper()}_LOG] Ticker: {current_ticker_sym}, Final Score: {final_weighted_score_for_source:.4f}, Items: {len(analyzed_item_details)}")
 
-    # --- Display Results (Only if analysis was attempted) ---
-    if 'stock_data' in locals() and stock_data: # Check if stock_data was fetched
-        st.subheader(f"Analysis Results for {company_name} ({ticker_input})")
-        col1, col2 = st.columns([1, 2]) # Adjust ratio as needed
+    # Store results in session state for display
+    # Note: 'ticker' and 'company_name' in this dict are the ones used for THIS analysis run.
+    analysis_result_dict = {
+        'final_score': final_weighted_score_for_source,
+        'analyzed_details': analyzed_item_details,
+        'suggestion': current_suggestion,
+        'validation_points': current_validation_points,
+        'source_description': source_description_name,
+        'ticker': current_ticker_sym,
+        'company_name': current_company_name
+    }
+    st.session_state.analysis_data = analysis_result_dict
+    return analysis_result_dict # Also return for direct use if needed
 
-        with col1:
-            # Display Stock Price and Info
-            current_price = stock_data.get('current_price', 'N/A')
-            price_display = f"${current_price:.2f}" if isinstance(current_price, (int, float)) else "N/A"
-            st.metric(label="Last Price", value=price_display)
+# --- Buttons for different sources ---
+col_buttons1, col_buttons2 = st.columns(2)
+analysis_was_triggered_this_run = False # To help with initial message display
 
-            # Add other key info if available
-            info = stock_data.get('info', {})
-            st.markdown(f"**Sector:** {info.get('sector', 'N/A')}")
-            st.markdown(f"**Industry:** {info.get('industry', 'N/A')}")
-            market_cap = info.get('marketCap')
-            if market_cap:
-                 st.markdown(f"**Market Cap:** ${market_cap:,}") # Format with commas
+# Global variables to store fetched stock info for the current ticker
+# These are fetched once if any analysis button is pressed.
+g_stock_data = None
+g_company_name = ticker_input # Default to ticker_input if stock info fetch fails
 
-            # Display Suggestion and Validation (if analysis ran)
-            if analysis_successful:
-                 st.markdown("---")
-                 st.subheader("AI Suggestion:")
-                 score_display = f"(Score: {aggregated_score:.3f})"
-                 if suggestion == "Strong Buy": st.success(f"**{suggestion}** {score_display}")
-                 elif suggestion == "Buy": st.success(f"**{suggestion}** {score_display}")
-                 elif suggestion == "Hold": st.info(f"**{suggestion}** {score_display}")
-                 elif suggestion == "Sell": st.error(f"**{suggestion}** {score_display}")
-                 elif suggestion == "Strong Sell": st.error(f"**{suggestion}** {score_display}")
+if ticker_input: # Only attempt to get stock info if a ticker is provided
+    # This get_stock_info is cached by Streamlit if called with the same ticker
+    g_stock_data = get_stock_info(ticker_input)
+    if g_stock_data:
+        g_company_name = g_stock_data.get("company_name", ticker_input)
+        # Save/update stock info in DB (idempotent operation)
+        save_stock_info(ticker_input, g_company_name)
+    else:
+        # Display error only once if it persists, not on every Streamlit rerun without button press
+        if 'stock_info_error_shown' not in st.session_state or st.session_state.stock_info_error_ticker != ticker_input:
+            st.error(f"Could not retrieve fundamental stock information for {ticker_input}. Please check the ticker. Analysis buttons disabled.")
+            st.session_state.stock_info_error_shown = True
+            st.session_state.stock_info_error_ticker = ticker_input
+        # Keep g_stock_data as None, buttons will be disabled.
+elif 'stock_info_error_shown' in st.session_state: # Clear error if ticker input is cleared
+    del st.session_state.stock_info_error_shown
+    if 'stock_info_error_ticker' in st.session_state:
+        del st.session_state.stock_info_error_ticker
 
-                 st.markdown("**Justification based on news:**")
-                 if validation_points:
-                     for point in validation_points:
-                         st.markdown(point, unsafe_allow_html=True) # Allow markdown links
-                 else:
-                      st.write("Could not extract specific validation points.")
-            elif not analysis_successful and 'aggregated_score' not in locals():
-                 # Handle case where analysis block failed before setting score
-                 st.warning("Analysis could not be completed due to an error.")
 
-        with col2:
-            st.subheader("Recent News Headlines Analyzed:")
-            if analysis_successful and analyzed_details:
-                 # Create a small dataframe for better display? Or just list.
-                 news_display = []
-                 for item in analyzed_details:
-                     # Simple display for MVP
-                     label_emoji = "🟢" if item['label'] == 'positive' else "🔴" if item['label'] == 'negative' else "⚪️"
-                     news_display.append(f"{label_emoji} [{item['headline']}]({item['url']})")
+# --- Button Logic ---
+# The `disabled` state of buttons now depends on `g_stock_data` being successfully fetched.
+with col_buttons1:
+    if st.button("Analyze News Sentiment 📰", key="news_btn", use_container_width=True, disabled=not g_stock_data):
+        if ticker_input and g_stock_data: # Double check, though disabled should prevent
+            perform_analysis(get_us_news, ticker_input, g_company_name, "News") # articles_count will use default from get_us_news
+            analysis_was_triggered_this_run = True
+        elif not ticker_input: st.warning("Please enter a stock ticker.")
+        # else: g_stock_data was None, button was disabled, this branch shouldn't be hit.
+with col_buttons2:
+    if st.button("Analyze Reddit Sentiment 👽", key="reddit_btn", use_container_width=True, disabled=not g_stock_data):
+        if ticker_input and g_stock_data:
+            perform_analysis(fetch_reddit_data, ticker_input, g_company_name, "Reddit")
+            analysis_was_triggered_this_run = True
+        elif not ticker_input: st.warning("Please enter a stock ticker.")
 
-                 if news_display:
-                     st.markdown("\n".join(f"- {line}" for line in news_display), unsafe_allow_html=True)
-                 else:
-                      st.write("No headlines were successfully analyzed.")
+st.markdown("---")
 
-            elif 'news_articles' in locals() and news_articles:
-                 # Display fetched headlines even if analysis part failed
-                 st.write("(Displaying fetched headlines as analysis may have failed)")
-                 for article in news_articles:
-                      st.markdown(f"- [{article.get('title', 'No Title')}]({article.get('url', '#')}) ({article.get('source',{}).get('name', 'Unknown Source')})")
-            else:
-                 st.write("No news headlines were found or process
-sed.")
+# --- Display results from session state ---
+if st.session_state.analysis_data:
+    res = st.session_state.analysis_data
+    # Use g_stock_data if available (it should be if analysis ran successfully for the current ticker)
+    # The 'ticker' and 'company_name' in 'res' are from the analysis run.
+    # g_stock_data is for the *current* ticker_input.
+    stock_data_for_display = g_stock_data if g_stock_data and res['ticker'] == ticker_input else get_stock_info(res['ticker'])
 
-elif not ticker_input and analyze_button:
-    st.warning("Please enter a stock ticker.")
-else:
-    # Initial state message
-    st.info("Enter a US stock ticker and click 'Analyze Sentiment ✨'.")
+    display_analysis_output(
+        stock_data_for_display, res['company_name'], res['ticker'],
+        res['final_score'], res['analyzed_details'],
+        res['suggestion'], res['validation_points'], res['source_description']
+    )
+elif not analysis_was_triggered_this_run and not any(st.session_state.get(f"{key}_btn_was_clicked", False) for key in ["news", "reddit"]):
+    # A more robust check if any analysis button was *ever* clicked could involve storing a flag in session_state on button press
+    st.info("Enter a stock ticker and select a data source (News, Reddit) to analyze sentiment.")
+    # To make the above condition more robust:
+    # At the end of each button's if block, set st.session_state[f"{source}_btn_was_clicked"] = True
 
 # --- Footer ---
 st.markdown("---")
-st.caption("Disclaimer: This tool provides AI-generated sentiment analysis based on public news data for informational purposes only. It is NOT financial advice. Verify information and conduct your own research before making any investment decisions.")
-----------------------------------------------
+st.caption("Disclaimer: This tool provides AI-generated sentiment analysis based on public data for informational purposes only. It is NOT financial advice. Verify information and conduct your own research before making any investment decisions.")
+-----------------------------------------------------------------------
+**data_fetcher.py**
+# data_fetcher.py
+import yfinance as yf
+from newsapi import NewsApiClient
+import logging
+import time
+import re # For relevance checking
+from newspaper import Article, ArticleException
+import praw
+from datetime import datetime, timedelta, timezone
+import streamlit as st # For caching
+
+from config import (
+    NEWSAPI_KEY, NEWS_ARTICLE_COUNT,
+    MIN_ARTICLE_LENGTH_FOR_ANALYSIS, MIN_TICKER_MENTIONS_FOR_RELEVANCE,
+    REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT,
+    REDDIT_POST_LIMIT_PER_SUBREDDIT, RELEVANT_SUBREDDITS, REDDIT_SEARCH_TIMESPAN, REDDIT_COMMENT_LIMIT_PER_POST,NEWS_DOMAIN_BLACKLIST, NEWS_SOURCE_NAME_BLACKLIST
+)
+
+# Setup logging (handled by app.py, but good for standalone testing)
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Initialize API Clients ---
+newsapi_client = None
+if NEWSAPI_KEY:
+    newsapi_client = NewsApiClient(api_key=NEWSAPI_KEY)
+else:
+    logging.warning("NewsAPI client not initialized (NEWSAPI_KEY missing).")
+
+reddit_praw_client = None
+if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and REDDIT_USER_AGENT:
+    try:
+        reddit_praw_client = praw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            user_agent=REDDIT_USER_AGENT,
+            check_for_async=False # Important for Streamlit/sync environments
+        )
+        if reddit_praw_client.read_only: # Check if authentication was successful for read-only mode
+             logging.info("PRAW Reddit client initialized successfully in read-only mode.")
+        else:
+             logging.warning("PRAW Reddit client initialized, but not in read-only mode. Check credentials if issues arise.")
+    except Exception as e:
+        logging.error(f"Failed to initialize PRAW Reddit client: {e}")
+else:
+    logging.warning("Reddit API credentials not fully configured. Reddit fetching disabled.")
+
+
+# --- Helper Functions ---
+def is_article_relevant(text_content, ticker_symbol, company_name):
+    """Checks if the article text is relevant based on mentions and length."""
+    if not text_content or len(text_content) < MIN_ARTICLE_LENGTH_FOR_ANALYSIS:
+        return False
+
+    mentions = 0
+    # Case-insensitive search for ticker (especially if it's like 'AAPL' or '$AAPL')
+    # For ticker, we might want to ensure it's a whole word or common cashtag format
+    ticker_pattern = r'\b{}\b|\${}\b'.format(re.escape(ticker_symbol), re.escape(ticker_symbol))
+    mentions += len(re.findall(ticker_pattern, text_content, re.IGNORECASE))
+
+    # Case-insensitive search for company name (as a whole phrase)
+    if company_name and len(company_name) > 2: # Avoid matching very short generic company names
+        company_pattern = r'\b{}\b'.format(re.escape(company_name))
+        mentions += len(re.findall(company_pattern, text_content, re.IGNORECASE))
+    
+    return mentions >= MIN_TICKER_MENTIONS_FOR_RELEVANCE
+
+@st.cache_data(ttl="15m", show_spinner=False)
+def get_stock_info(ticker):
+    logging.info(f"Executing get_stock_info for {ticker} (Cacheable).")
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        if not info or not info.get('symbol'):
+            logging.warning(f"Initial yfinance info for {ticker} is empty/invalid. Trying history.")
+            hist = stock.history(period="2d") # Get 2 days to ensure we have a close
+            if hist.empty:
+                logging.error(f"Cannot retrieve info or history for {ticker}. Likely invalid or delisted.")
+                return None
+            current_price = hist['Close'].iloc[-1] if not hist.empty else 'N/A'
+            company_name = ticker
+            info_dict = {'symbol': ticker, 'longName': company_name, 'currency': info.get('currency', 'N/A')} # Minimal info
+        else:
+            current_price = info.get('currentPrice', info.get('regularMarketPrice', info.get('previousClose')))
+            company_name = info.get('longName', info.get('shortName', ticker))
+            info_dict = info
+        
+        if current_price is None: current_price = "N/A" # Ensure price is not None
+
+        logging.info(f"Successfully processed yfinance data for {ticker}")
+        return {"info": info_dict, "current_price": current_price, "company_name": company_name}
+    except Exception as e:
+        logging.error(f"Error fetching yfinance data for {ticker}: {e}", exc_info=True)
+        return None
+
+def fetch_full_article_text_newspaper(url):
+    if not url: return None
+    try:
+        logging.debug(f"Newspaper3k: Attempting to fetch full text for: {url}")
+        article = Article(url, language='en', fetch_images=False, memoize_articles=True) # memoize_articles can speed up repeated calls to same URL
+        article.download()
+        # time.sleep(0.5) # Small delay, Newspaper might have internal ones
+        article.parse()
+        logging.debug(f"Newspaper3k: Successfully parsed: {url}")
+        return article.text
+    except ArticleException as e:
+        logging.warning(f"Newspaper3k failed for URL {url}: {e}")
+        return None
+    except Exception as e: # Catch any other unexpected errors
+        logging.error(f"Newspaper3k: Unexpected error fetching article {url}: {e}", exc_info=False)
+        return None
+
+# --- Main Data Fetching Functions ---
+def get_us_news(ticker_symbol, company_name, articles_count=NEWS_ARTICLE_COUNT):
+    """Fetches news from NewsAPI and enriches with full text."""
+    if not newsapi_client:
+        logging.error("Cannot fetch US news: NewsAPI client not available.")
+        return []
+
+    # Use company name for broader search, add ticker for specificity
+    query = f'"{company_name}" OR "{ticker_symbol}"'
+    logging.info(f"Fetching {articles_count} US news for query: '{query}'")
+    
+    try:
+        api_response = newsapi_client.get_everything(
+            q=query, language='en', sort_by='publishedAt',
+            page_size=min(articles_count, 100), page=1
+        )
+        articles_metadata = api_response.get('articles', [])
+    except Exception as e:
+        logging.error(f"NewsAPI error for query '{query}': {e}", exc_info=True)
+        return []
+
+    enriched_articles = []
+    processed_urls = set()
+    for meta in articles_metadata:
+        title = meta.get('title')
+        url = meta.get('url')
+        published_at_str = meta.get('publishedAt')
+        source_info = meta.get('source', {})
+        source_name = source_info.get('name', 'Unknown News Source')
+
+        if not title or title == '[Removed]' or not url or not published_at_str:
+            continue
+        processed_urls.add(url)
+        # <<< START RELEVANCE FILTERING (BLACKLISTING) >>>
+        # 1. Domain blacklisting (extract domain from URL)
+        try:
+            domain = url.split('/')[2].replace('www.', '')
+            if domain in NEWS_DOMAIN_BLACKLIST:
+                logging.debug(f"Skipping blacklisted domain: {domain} for article: {url}")
+                continue
+        except IndexError:
+            logging.warning(f"Could not parse domain from URL: {url}")
+            # Decide whether to continue or skip if domain parsing fails
+
+        # 2. Source Name blacklisting
+        if source_name in NEWS_SOURCE_NAME_BLACKLIST:
+            logging.debug(f"Skipping blacklisted source name: {source_name} for article: {url}")
+            continue
+        # <<< END RELEVANCE FILTERING (BLACKLISTING) >>>
+        # Fetch full text (this can be slow)
+        full_text_content = fetch_full_article_text_newspaper(url)
+
+        if not full_text_content or len(full_text_content) < MIN_ARTICLE_LENGTH_FOR_ANALYSIS:
+            # If full text is too short or unavailable, use description if available, else just title
+            full_text_content = meta.get('description', title) 
+            if not full_text_content: full_text_content = title
+
+
+        if is_article_relevant(full_text_content, ticker_symbol, company_name):
+            enriched_articles.append({
+                'headline': title,
+                'full_text': full_text_content,
+                'url': url,
+                'publishedAt': published_at_str, # Keep as string, parsing done in sentiment analyzer or DB
+                'source_name': meta.get('source', {}).get('name', 'Unknown News Source'),
+                'source_type': 'news'
+            })
+            if len(enriched_articles) >= articles_count : # Stop if we have enough relevant articles
+                break
+    
+    logging.info(f"Fetched and processed {len(enriched_articles)} relevant news articles.")
+    return enriched_articles
+
+
+def fetch_reddit_data(ticker_symbol, company_name, **kwargs): # Added **kwargs for perform_analysis compatibility
+    if not reddit_praw_client:
+        logging.warning("Reddit client not available for fetching data.")
+        return []
+
+    search_terms = [company_name, ticker_symbol]
+    if company_name.lower() != ticker_symbol.lower(): # Avoid duplicate if they are same
+        search_query = f'"{company_name}" OR "{ticker_symbol}" OR "{ticker_symbol.replace("$","")}"' # search for $TICKER and TICKER
+    else:
+        search_query = f'"{company_name}" OR "{ticker_symbol.replace("$","")}"'
+
+    logging.info(f"Fetching Reddit data for query: '{search_query}' across subreddits.")
+    reddit_content = []
+    processed_ids = set() # To avoid processing same post/comment multiple times if found via different paths
+
+    for sub_name in RELEVANT_SUBREDDITS:
+        if len(reddit_content) >= REDDIT_POST_LIMIT_PER_SUBREDDIT * len(RELEVANT_SUBREDDITS) / 2 : # Soft overall limit
+            break
+        try:
+            subreddit = reddit_praw_client.subreddit(sub_name)
+            logging.debug(f"Searching r/{sub_name} for '{search_query}' (limit {REDDIT_POST_LIMIT_PER_SUBREDDIT})")
+            
+            for submission in subreddit.search(search_query, sort='new', time_filter=REDDIT_SEARCH_TIMESPAN, limit=REDDIT_POST_LIMIT_PER_SUBREDDIT):
+                if submission.id in processed_ids: continue
+                processed_ids.add(submission.id)
+
+                post_title = submission.title
+                post_body = submission.selftext if submission.selftext else ""
+                combined_text = f"{post_title}. {post_body}"
+
+                if is_article_relevant(combined_text, ticker_symbol, company_name):
+                    reddit_content.append({
+                        'headline': post_title[:250],
+                        'full_text': combined_text,
+                        'url': f"https://reddit.com{submission.permalink}",
+                        'publishedAt': datetime.fromtimestamp(submission.created_utc, timezone.utc).isoformat(),
+                        'source_name': f"r/{sub_name}",
+                        'source_type': 'reddit_post',
+                        'id': submission.id # For DB if needed
+                    })
+
+                    # Fetch comments for this relevant post
+                    comment_fetch_count = 0
+                    try:
+                        submission.comments.replace_more(limit=0) # Expand top comments
+                        for comment in submission.comments.list():
+                            if comment.id in processed_ids: continue
+                            if comment_fetch_count >= REDDIT_COMMENT_LIMIT_PER_POST: break
+                            if isinstance(comment, praw.models.MoreComments): continue
+                            
+                            processed_ids.add(comment.id)
+                            if is_article_relevant(comment.body, ticker_symbol, company_name):
+                                reddit_content.append({
+                                    'headline': f"Comment on: {post_title[:100]}...",
+                                    'full_text': comment.body,
+                                    'url': f"https://reddit.com{comment.permalink}",
+                                    'publishedAt': datetime.fromtimestamp(comment.created_utc, timezone.utc).isoformat(),
+                                    'source_name': f"r/{sub_name} comment",
+                                    'source_type': 'reddit_comment',
+                                    'id': comment.id
+                                })
+                                comment_fetch_count += 1
+                    except Exception as ce:
+                        logging.warning(f"Could not process comments for post {submission.id} in r/{sub_name}: {ce}")
+                if len(reddit_content) >= REDDIT_POST_LIMIT_PER_SUBREDDIT * 3: # Harder overall limit
+                    break
+        except Exception as e:
+            logging.error(f"Error fetching data from subreddit r/{sub_name}: {e}")
+            time.sleep(0.5) # Brief pause
+
+    logging.info(f"Fetched {len(reddit_content)} items from Reddit.")
+    return reddit_content
+
+
+
+def scrape_indian_news(ticker_symbol, company_name, **kwargs): # Added for consistency
+    logging.warning(f"Indian news scraping for {ticker_symbol} is not implemented.")
+    return []
+-----------------------------------------------------------------------
+**database.py**
+# database.py
+import sqlite3
+from config import DB_NAME # Make sure DB_NAME is correctly defined in config.py
+import logging
+from datetime import datetime, timezone
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+
+def get_db_connection():
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON;")
+        return conn
+    except sqlite3.Error as e:
+        logging.error(f"Error connecting to database '{DB_NAME}': {e}")
+        return None
+
+def create_tables():
+    conn = get_db_connection()
+    if conn is None:
+        logging.critical("CRITICAL: Cannot create tables - Database connection failed.") # More severe log
+        raise ConnectionError("DB connection failed for table creation.")
+    try:
+        with conn:
+            cursor = conn.cursor()
+            # Stocks table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS Stocks (
+                ticker TEXT PRIMARY KEY,
+                company_name TEXT,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            logging.info("Checked/Created Stocks table.")
+
+            # NewsMediaItems Table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS NewsMediaItems (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, -- Auto-incrementing ID
+                ticker TEXT NOT NULL,
+                headline TEXT NOT NULL,
+                url TEXT UNIQUE NOT NULL,
+                publisher_name TEXT,
+                full_text_content TEXT,
+                published_at TIMESTAMP,
+                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                sentiment_score REAL,
+                sentiment_label TEXT,
+                FOREIGN KEY (ticker) REFERENCES Stocks (ticker) ON DELETE CASCADE
+            );
+            """)
+            logging.info("Checked/Created NewsMediaItems table.")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_newsmedia_ticker_published ON NewsMediaItems (ticker, published_at DESC);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_newsmedia_url ON NewsMediaItems (url);") # For UNIQUE constraint
+
+            # RedditItems Table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS RedditItems (
+                reddit_id TEXT PRIMARY KEY,     -- PRAW's submission.id or comment.id
+                ticker TEXT NOT NULL,
+                item_type TEXT NOT NULL,        -- 'post' or 'comment'
+                title_text TEXT,                -- For posts (from 'headline' in fetched item)
+                body_text_content TEXT,         -- Post selftext or comment body (from 'full_text' in fetched item)
+                url TEXT UNIQUE NOT NULL,       -- Permalink
+                subreddit_name TEXT,            -- From 'source_name' in fetched item
+                author_name TEXT,
+                item_score INTEGER,
+                num_comments_on_post INTEGER,
+                published_at TIMESTAMP,
+                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                sentiment_score REAL,
+                sentiment_label TEXT,
+                FOREIGN KEY (ticker) REFERENCES Stocks (ticker) ON DELETE CASCADE
+            );
+            """)
+            logging.info("Checked/Created RedditItems table.")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_ticker_published ON RedditItems (ticker, published_at DESC);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_url ON RedditItems (url);") # For UNIQUE constraint
+
+
+        logging.info("All database tables checked/created successfully.")
+    except sqlite3.Error as e:
+        logging.critical(f"CRITICAL: Error creating tables: {e}", exc_info=True)
+        raise
+    finally:
+        if conn: conn.close()
+
+def save_stock_info(ticker, company_name):
+    conn = get_db_connection()
+    if conn is None: return False
+    try:
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO Stocks (ticker, company_name, last_updated)
+                VALUES (?, ?, ?)
+            """, (ticker, company_name, datetime.now(timezone.utc)))
+        logging.debug(f"Saved/Updated stock info for {ticker}")
+        return True
+    except sqlite3.Error as e:
+        logging.error(f"Error saving stock info for {ticker}: {e}")
+        return False
+    finally:
+        if conn: conn.close()
+
+def _parse_datetime(published_str):
+    """Helper to parse datetime strings robustly, returning timezone-aware UTC datetime or None."""
+    if not published_str: return None
+    try:
+        if isinstance(published_str, datetime): # If already a datetime object
+            if published_str.tzinfo is None or published_str.tzinfo.utcoffset(published_str) is None:
+                return published_str.replace(tzinfo=timezone.utc) # Assume UTC if naive
+            return published_str.astimezone(timezone.utc) # Convert to UTC if timezone-aware
+
+        # Handle ISO format strings, especially those ending with 'Z'
+        if published_str.endswith('Z'):
+            published_str = published_str[:-1] + '+00:00'
+        dt = datetime.fromisoformat(published_str)
+        
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+            return dt.replace(tzinfo=timezone.utc) # Assume UTC if naive
+        return dt.astimezone(timezone.utc) # Convert to UTC
+    except ValueError:
+        logging.warning(f"Could not parse timestamp: '{published_str}'. Storing as NULL.")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error parsing timestamp '{published_str}': {e}")
+        return None
+
+# --- Internal save functions for each table ---
+def _save_news_media_items_internal(conn, ticker_symbol, news_items):
+    tuples_to_save = []
+    for item in news_items:
+        url = item.get('url')
+        if not url: # URL is critical for news items as unique identifier
+            logging.warning(f"Skipping news item due to missing URL: {item.get('headline', 'No Headline')}")
+            continue
+        tuples_to_save.append((
+            ticker_symbol,
+            item.get('headline', 'N/A')[:500], # Limit headline length
+            url,
+            item.get('source_name'), # This maps to publisher_name
+            item.get('full_text'),   # This maps to full_text_content
+            _parse_datetime(item.get('publishedAt'))
+        ))
+    
+    saved_count = 0
+    if not tuples_to_save: return 0
+    try:
+        cursor = conn.cursor()
+        cursor.executemany("""
+            INSERT OR IGNORE INTO NewsMediaItems
+            (ticker, headline, url, publisher_name, full_text_content, published_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, tuples_to_save)
+        saved_count = cursor.rowcount
+        if saved_count > 0: logging.info(f"Saved {saved_count} new news items for {ticker_symbol}.")
+    except sqlite3.Error as e:
+        logging.error(f"DB Error saving news items for {ticker_symbol}: {e}", exc_info=True)
+    return saved_count
+
+def _save_reddit_items_internal(conn, ticker_symbol, reddit_items):
+    tuples_to_save = []
+    for item in reddit_items:
+        reddit_native_id = item.get('id') # This is 'reddit_id' (PK)
+        url = item.get('url')
+        if not reddit_native_id or not url:
+            logging.warning(f"Skipping Reddit item due to missing 'id' or 'url': Title='{item.get('headline')}'")
+            continue
+        
+        tuples_to_save.append((
+            reddit_native_id,
+            ticker_symbol,
+            item.get('source_type', 'reddit_unknown').replace('reddit_', ''), # 'post' or 'comment'
+            item.get('title_text', item.get('headline')), # 'title_text' for DB
+            item.get('body_text_content', item.get('full_text')), # 'body_text_content' for DB
+            url,
+            item.get('source_name'), # subreddit_name
+            item.get('author_name', 'N/A'),
+            item.get('item_score', 0),
+            item.get('num_comments_on_post', 0),
+            _parse_datetime(item.get('publishedAt'))
+        ))
+
+    saved_count = 0
+    if not tuples_to_save: return 0
+    try:
+        cursor = conn.cursor()
+        cursor.executemany("""
+            INSERT OR IGNORE INTO RedditItems
+            (reddit_id, ticker, item_type, title_text, body_text_content, url, subreddit_name, author_name, item_score, num_comments_on_post, published_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, tuples_to_save)
+        saved_count = cursor.rowcount
+        if saved_count > 0: logging.info(f"Saved {saved_count} new Reddit items for {ticker_symbol}.")
+    except sqlite3.Error as e:
+        logging.error(f"DB Error saving Reddit items for {ticker_symbol}: {e}", exc_info=True)
+    return saved_count
+
+
+# --- Public function to save content (this is what app.py imports) ---
+def save_content_items(ticker_symbol, content_items_list):
+    """
+    Routes content items to their respective internal save functions based on 'source_type'.
+    """
+    if not content_items_list: return 0
+    conn = get_db_connection()
+    if conn is None: return 0
+
+    news_to_save, reddit_to_save = [], []
+    for item in content_items_list:
+        source_type = item.get('source_type', 'unknown').lower()
+        if 'news' in source_type: news_to_save.append(item)
+        elif 'reddit' in source_type: reddit_to_save.append(item)
+        else: logging.warning(f"Unknown source_type '{source_type}' for item URL: {item.get('url')}")
+
+    total_saved_count = 0
+    try:
+        with conn: # Use a single transaction for all saves
+            if news_to_save:
+                total_saved_count += _save_news_media_items_internal(conn, ticker_symbol, news_to_save)
+            if reddit_to_save:
+                total_saved_count += _save_reddit_items_internal(conn, ticker_symbol, reddit_to_save)
+       
+        if total_saved_count > 0:
+            logging.info(f"Successfully saved a total of {total_saved_count} items to DB for {ticker_symbol}.")
+    except sqlite3.Error as e: # Catch transaction-level errors if any
+        logging.error(f"Transaction error during save_content_items for {ticker_symbol}: {e}", exc_info=True)
+    finally:
+        if conn: conn.close() # Ensure connection is closed even if transaction context manager was used.
+    
+    return total_saved_count
+
+
+def update_sentiment_for_items(analyzed_results_list):
+    """Updates sentiment for items in their respective tables using their source-specific ID or URL."""
+    if not analyzed_results_list: return 0
+    conn = get_db_connection()
+    if conn is None: return 0
+
+    updates_by_table = {'NewsMediaItems': [], 'RedditItems': []}
+    # Define the ID column used in the WHERE clause for each table
+    id_column_map = {'NewsMediaItems': 'url', 'RedditItems': 'reddit_id'}
+
+    for result in analyzed_results_list:
+        score = result.get('score')
+        label = result.get('label')
+        source_type = result.get('source_type', 'unknown').lower()
+        item_identifier = result.get('source_specific_id') # Should be populated by sentiment_analyzer
+        
+        table_name = None
+        id_column_name = None
+
+        if 'news' in source_type:
+            table_name = 'NewsMediaItems'
+            id_column_name = id_column_map[table_name]
+            # For news, source_specific_id in analyzed_results should be the URL
+            if not item_identifier: item_identifier = result.get('url') 
+        elif 'reddit' in source_type:
+            table_name = 'RedditItems'
+            id_column_name = id_column_map[table_name]
+            id_column_name = id_column_map[table_name]
+        else:
+            logging.warning(f"Cannot update sentiment for unknown source_type: {source_type}")
+            continue
+
+        if table_name and item_identifier is not None and score is not None and label is not None:
+            updates_by_table[table_name].append((score, label, item_identifier))
+        else:
+            logging.warning(f"Skipping sentiment update due to missing data: ID={item_identifier}, Score={score}, Label={label} for {source_type}")
+
+    total_updated_count = 0
+    try:
+        with conn:
+            cursor = conn.cursor()
+            for table_name, updates in updates_by_table.items():
+                if updates:
+                    id_col_for_where = id_column_map[table_name]
+                    # Only update if sentiment_score is currently NULL (avoid re-processing)
+                    # Or remove "AND sentiment_score IS NULL" to always update.
+                    sql = f""" 
+                        UPDATE {table_name}
+                        SET sentiment_score = ?, sentiment_label = ?
+                        WHERE {id_col_for_where} = ? AND (sentiment_score IS NULL OR sentiment_label IS NULL)
+                    """
+                    try:
+                        cursor.executemany(sql, updates)
+                        updated_for_table = cursor.rowcount
+                        if updated_for_table > 0:
+                            logging.info(f"Updated sentiment for {updated_for_table} items in {table_name}.")
+                        total_updated_count += updated_for_table
+                    except sqlite3.Error as e_table:
+                        logging.error(f"Error updating {table_name}: {e_table}. Updates: {updates[:2]}") # Log first few failing updates
+    except sqlite3.Error as e:
+        logging.error(f"Transaction error during update_sentiment_for_items: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+    return total_updated_count
+
+if __name__ == "__main__":
+    print(f"Initializing database '{DB_NAME}'...")
+    create_tables() # This will also create indexes
+    print("Database initialization complete.")
+-----------------------------------------------------------------------
 **config.py**
 # config.py
 import os
@@ -194,7 +830,10 @@ load_dotenv()
 
 # --- API Keys ---
 NEWSAPI_KEY = os.getenv('NEWSAPI_KEY')
-
+# Reddit API Keys (ensure these are in your .env file)
+REDDIT_CLIENT_ID = os.getenv('REDDIT_CLIENT_ID')
+REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET')
+REDDIT_USER_AGENT = os.getenv('REDDIT_USER_AGENT', 'StockSentimentApp/0.1 by YourUsername') # e.g., "StockApp/0.1 by u/your_reddit_username"
 if not NEWSAPI_KEY:
     print("Warning: NEWSAPI_KEY not found in environment variables. Please set it in your .env file.")
 
@@ -212,435 +851,233 @@ DEFAULT_SENTIMENT_MODEL = "ProsusAI/finbert"
 # --- Other Constants ---
 # Number of news articles to fetch/analyze
 NEWS_ARTICLE_COUNT = 20 # Adjust as needed (consider NewsAPI limits)
---------------------------------------------------------------------
-**data_fetcher.py**
-# data_fetcher.py
-import yfinance as yf
-from newsapi import NewsApiClient
-import requests # Keep for future Indian scraping
-from bs4 import BeautifulSoup # Keep for future Indian scraping
-import logging
-from config import NEWSAPI_KEY, NEWS_ARTICLE_COUNT
-
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Initialize NewsAPI client
-if NEWSAPI_KEY:
-    newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
-else:
-    newsapi = None
-    logging.warning("NewsAPI client not initialized because NEWSAPI_KEY is missing.")
-
-# --- Phase 1 Implementation ---
-
-def get_stock_info(ticker):
-    """Fetches basic stock information and current price using yfinance."""
-    logging.info(f"Attempting to fetch stock info for {ticker} using yfinance.")
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-
-        # Check if info was successfully retrieved
-        if not info or info.get('regularMarketPrice') is None: # Check for a key field
-             logging.warning(f"Could not retrieve valid info for ticker {ticker}. It might be delisted or invalid.")
-             # Try history as fallback for price if info missing
-             hist = stock.history(period="1d")
-             current_price = hist['Close'].iloc[-1] if not hist.empty else 'N/A'
-             company_name = ticker # Default to ticker if name not found
-             info_dict = {'symbol': ticker, 'longName': company_name} # Basic fallback info
-        else:
-            current_price = info.get('currentPrice', info.get('regularMarketPrice', 'N/A')) # Prefer currentPrice if available
-            company_name = info.get('longName', ticker)
-            info_dict = info # Use the full info dict
-
-        logging.info(f"Successfully fetched yfinance data for {ticker}")
-        return {"info": info_dict, "current_price": current_price, "company_name": company_name}
-
-    except Exception as e:
-        # Common errors include connection issues, or invalid tickers yfinance cannot resolve
-        logging.error(f"Error fetching yfinance data for {ticker}: {e}")
-        return None # Indicate failure
-
-def get_us_news(query, articles_count=NEWS_ARTICLE_COUNT):
-    """Fetches news articles for a US stock query using NewsAPI."""
-    if not newsapi:
-        logging.error("Cannot fetch US news: NewsAPI client not available.")
-        return [] # Return empty list if client not set up
-
-    logging.info(f"Fetching up to {articles_count} US news articles for query: '{query}' from NewsAPI.")
-    try:
-        # Use 'q' for keyword search. Consider adding domains for reliability e.g., domains='wsj.com,reuters.com'
-        all_articles = newsapi.get_everything(q=query,
-                                              language='en',
-                                              sort_by='publishedAt', # Use 'relevancy' if preferred
-                                              page_size=articles_count, # Fetch desired count
-                                              page=1) # Get the first page
-
-        fetched_articles = all_articles.get('articles', [])
-        logging.info(f"Fetched {len(fetched_articles)} articles for '{query}' from NewsAPI.")
-        # Optional: Add basic filtering here if needed (e.g., ensure title isn't '[Removed]')
-        filtered_articles = [a for a in fetched_articles if a.get('title') and a.get('title') != '[Removed]']
-        if len(filtered_articles) < len(fetched_articles):
-             logging.info(f"Filtered out {len(fetched_articles) - len(filtered_articles)} articles with missing/removed titles.")
-
-        return filtered_articles
-
-    except Exception as e:
-        # Handle potential API errors (rate limits, invalid queries, connection issues)
-        logging.error(f"Error fetching NewsAPI data for query '{query}': {e}")
-        # Check if the error response is available and log it
-        if hasattr(e, 'response') and e.response is not None:
-             try:
-                 logging.error(f"NewsAPI Response: {e.response.json()}")
-             except: # Handle cases where response is not JSON
-                 logging.error(f"NewsAPI Response Text: {e.response.text}")
-        return [] # Return empty list on error
+MIN_ARTICLE_LENGTH_FOR_ANALYSIS = 200 # Min characters for full_text to be considered substantial
+MIN_TICKER_MENTIONS_FOR_RELEVANCE = 2 # Min times ticker/company name should appear in full_text
+RECENCY_DECAY_HALF_LIFE_HOURS = 24.0
+# Intensity boost: score_weight = 1 + abs(sentiment_score) * INTENSITY_BOOST_FACTOR
+INTENSITY_BOOST_FACTOR = 0.2
+NEWS_DOMAIN_BLACKLIST = [
+    "bleepingcomputer.com",
+    "techsupportalert.com",
+    # Add other non-financial tech/general sites as you find them
+]
+NEWS_SOURCE_NAME_BLACKLIST = [
+    "BleepingComputer", # Case-sensitive match if NewsAPI returns it this way
+    # Add other source names if needed
+]
+# --- Social Media Fetching Configuration ---
+# >>> NEW: Reddit Configuration <<<
+REDDIT_POST_LIMIT_PER_SUBREDDIT = 20 # How many recent posts to check per subreddit
+REDDIT_COMMENT_LIMIT_PER_POST = 10   # How many top comments to check per relevant post
+REDDIT_SEARCH_TIMESPAN = 'week'    # 'day', 'week', 'month'
+# Define subreddits to search (general and potentially stock-specific)
+RELEVANT_SUBREDDITS = ['stocks', 'investing', 'StockMarket', 'wallstreetbets', 'finance', 'SecurityAnalysis']
+# Add Indian ones if targeting: 'IndiaInvestments', 'IndianStockMarket'
 
 
-# --- Placeholder for Phase 2 ---
-def scrape_indian_news(ticker):
-    """Placeholder for scraping news for Indian stocks."""
-    logging.warning(f"Indian news scraping for {ticker} is not implemented in Phase 1.")
-    return []
---------------------------------------------------
-**sentiment_analysis.py**
+-----------------------------------------------------------------------
+**sentiment_analyzer.py**
 # sentiment_analyzer.py
-from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import pipeline
 import logging
-from config import DEFAULT_SENTIMENT_MODEL
-import torch # Or tensorflow if using TF models
+from config import DEFAULT_SENTIMENT_MODEL, RECENCY_DECAY_HALF_LIFE_HOURS, INTENSITY_BOOST_FACTOR
+import torch
+from datetime import datetime, timezone
+import math
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# NOTE: The actual model loading and caching happens in main.py using @st.cache_resource.
-# This file defines the logic that USES the loaded model.
+# Logging setup (main app.py usually handles this)
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def get_sentiment_pipeline(model_name=DEFAULT_SENTIMENT_MODEL):
-    """
-    Helper function to load the sentiment analysis pipeline.
-    This function itself isn't cached here, but called by the cached function in main.py.
-    """
     logging.info(f"Attempting to initialize sentiment pipeline with model: {model_name}")
     try:
-        # Check for GPU availability, use it if possible
-        device = 0 if torch.cuda.is_available() else -1 # 0 for CUDA GPU, -1 for CPU
-        # For TensorFlow: device = 0 if tf.config.list_physical_devices('GPU') else -1
-        logging.info(f"Using device: {'GPU' if device == 0 else 'CPU'}")
-
-        sentiment_pipeline = pipeline(
-            "sentiment-analysis",
-            model=model_name,
-            tokenizer=model_name, # Explicitly pass tokenizer
-            device=device # Specify CPU or GPU
-            # Add truncation=True if headlines might exceed model limits, though less likely for headlines
+        device = 0 if torch.cuda.is_available() else -1
+        logging.info(f"Using device: {'GPU' if device == 0 else 'CPU'} for Hugging Face pipeline.")
+        sentiment_pipeline_instance = pipeline(
+            "sentiment-analysis", model=model_name, tokenizer=model_name, device=device, truncation=True
         )
         logging.info(f"Sentiment analysis pipeline loaded successfully for model '{model_name}'.")
-        return sentiment_pipeline
+        return sentiment_pipeline_instance
     except Exception as e:
         logging.error(f"Error loading sentiment model '{model_name}': {e}", exc_info=True)
         return None
 
-
-def analyze_sentiment_for_ticker(news_articles, sentiment_pipeline):
+def analyze_sentiment_for_ticker(fetched_content_list, sentiment_pipeline_instance):
     """
-    Analyzes sentiment for a list of news articles (headlines initially)
-    using the provided (and cached) sentiment pipeline.
+    Analyzes sentiment for a list of fetched content items.
+    Each item in fetched_content_list is a dict from data_fetcher.
     """
-    if not news_articles:
-        logging.warning("No news articles provided for sentiment analysis.")
-        return 0.0, [] # Return neutral score and empty details
+    if not fetched_content_list:
+        logging.warning("No content provided for sentiment analysis.")
+        return [] # Return empty list of details
 
-    if sentiment_pipeline is None:
+    if sentiment_pipeline_instance is None:
         logging.error("Sentiment pipeline is not available. Cannot analyze.")
-        return 0.0, []
+        return []
 
-    logging.info(f"Analyzing sentiment for {len(news_articles)} articles...")
-    analyzed_results = []
-    total_score = 0.0
-    analyzed_count = 0
+    logging.info(f"Analyzing sentiment for {len(fetched_content_list)} items...")
+    analyzed_details_list = []
 
-    headlines = [article.get('title', '') for article in news_articles if article.get('title')]
-    urls = [article.get('url', '') for article in news_articles if article.get('title')] # Keep track of urls
+    # Prepare texts and keep track of original items
+    texts_for_analysis = []
+    original_items_map = [] # To map results back to original item data
 
-    if not headlines:
-        logging.warning("No valid headlines found in the provided articles.")
-        return 0.0, []
+    for i, item in enumerate(fetched_content_list):
+        text_to_analyze = item.get('full_text', item.get('headline')) # Prioritize full_text
+        if not text_to_analyze:
+            logging.warning(f"Skipping item due to missing text content: {item.get('url', 'N/A')}")
+            continue
+        texts_for_analysis.append(text_to_analyze)
+        original_items_map.append(item) # Store the whole original item
+
+    if not texts_for_analysis:
+        logging.warning("No valid text found in content items to analyze.")
+        return []
 
     try:
-        # Process headlines in batches for potentially better performance
-        # The pipeline handles batching internally if you pass a list
-        results = sentiment_pipeline(headlines, truncation=True, max_length=512) # Add truncation
+        logging.info(f"Running HF pipeline on {len(texts_for_analysis)} text pieces...")
+        # FinBERT's default max_length is 512. Truncation is important.
+        results = sentiment_pipeline_instance(texts_for_analysis, truncation=True, max_length=512)
+        logging.info("HF pipeline processing complete.")
 
         for i, result in enumerate(results):
-            score = result['score']
-            label = result['label'].lower() # Normalize label to lowercase for consistency
-            headline = headlines[i]
-            url = urls[i]
+            original_item = original_items_map[i]
+            
+            model_score = result['score']
+            model_label = result['label'].lower()
 
-            # --- Score Normalization ---
-            # Convert label/score to a single score in range [-1, 1]
-            # Assumes 'POSITIVE'/'NEGATIVE' labels from distilbert-sst2
-            # Adjust if using a model with different labels (e.g., POSITIVE/NEGATIVE/NEUTRAL or numeric labels)
-            if label == 'positive':
-                normalized_score = score
-            elif label == 'negative':
-                normalized_score = -score
-            elif label == 'neutral':
-                normalized_score = 0.0
-            else: # Handle potential 'NEUTRAL' or other labels if model changes
-                 logging.warning(f"Unexpected sentiment label '{label}' for model. Treating as neutral (0.0).")
-                 normalized_score = 0.0
-
-            analyzed_results.append({
-                'headline': headline,
-                'url': url, # Include URL for linking
-                'score': normalized_score, # Store the [-1, 1] score
-                'label': label # Store the original label
+            normalized_score = 0.0
+            if model_label == 'positive':
+                normalized_score = model_score
+            elif model_label == 'negative':
+                normalized_score = -model_score
+            elif model_label == 'neutral':
+                normalized_score = 0.0 
+            else:
+                 logging.warning(f"Unexpected sentiment label '{model_label}'. Treating as neutral.")
+            
+            analyzed_details_list.append({
+                'headline': original_item.get('headline', 'N/A'), # For display
+                'full_text_analyzed': texts_for_analysis[i][:100]+'...', # For debug, show what was analyzed
+                'url': original_item.get('url'),
+                'score': normalized_score, # Model's normalized score [-1, 1]
+                'label': model_label,      # Model's label ('positive', 'negative', 'neutral')
+                'publishedAt': original_item.get('publishedAt'), # Crucial for recency
+                'source_name': original_item.get('source_name', 'Unknown'),
+                'source_type': original_item.get('source_type', 'unknown')
             })
-            total_score += normalized_score
-            analyzed_count += 1
 
     except Exception as e:
         logging.error(f"Error during batch sentiment analysis: {e}", exc_info=True)
-        # Fallback to individual analysis if batch fails (optional)
-        # ... (implement fallback loop here if needed) ...
 
-    if analyzed_count > 0:
-        aggregated_score = total_score / analyzed_count
-        logging.info(f"Sentiment analysis complete. Aggregated score: {aggregated_score:.4f} from {analyzed_count} articles.")
-    else:
-        aggregated_score = 0.0
-        logging.warning("No articles were successfully analyzed.")
+    logging.info(f"Sentiment analysis produced details for {len(analyzed_details_list)} items.")
+    return analyzed_details_list
 
-    return aggregated_score, analyzed_results
+
+def calculate_weighted_sentiment(analyzed_details_list, 
+                                 recency_half_life_hours=RECENCY_DECAY_HALF_LIFE_HOURS, 
+                                 intensity_boost_factor=INTENSITY_BOOST_FACTOR):
+    """
+    Calculates a single weighted sentiment score from a list of analyzed items.
+    Weights are based on recency and sentiment intensity.
+    """
+    if not analyzed_details_list:
+        logging.warning("No analyzed details to calculate weighted sentiment from.")
+        return 0.0
+
+    total_weighted_score_sum = 0.0
+    total_weight_sum = 0.0
+    now_utc = datetime.now(timezone.utc)
+
+    for item in analyzed_details_list:
+        sentiment_score = item['score'] # This is the normalized score from the model
+        published_at_str = item.get('publishedAt')
+
+        # 1. Recency Weight
+        recency_weight = 0.1 # Default small weight if no date
+        if published_at_str:
+            try:
+                # Ensure 'Z' is handled for ISO format
+                if published_at_str.endswith('Z'):
+                    published_at_str = published_at_str[:-1] + '+00:00'
+                published_dt = datetime.fromisoformat(published_at_str)
+                # Ensure it's offset-aware UTC
+                if published_dt.tzinfo is None or published_dt.tzinfo.utcoffset(published_dt) is None:
+                    published_dt = published_dt.replace(tzinfo=timezone.utc) # Assume UTC if naive
+                else:
+                    published_dt = published_dt.astimezone(timezone.utc)
+
+                age_hours = (now_utc - published_dt).total_seconds() / 3600.0
+                if age_hours < 0: age_hours = 0 # Future posts get max recency
+                
+                # Exponential decay: weight = exp(-ln(2) * age / half_life)
+                recency_weight = math.exp(-math.log(2) * age_hours / recency_half_life_hours)
+            except ValueError:
+                logging.warning(f"Could not parse 'publishedAt' timestamp: {published_at_str}. Using default recency weight.")
+        
+        # 2. Intensity Weight (based on the sentiment score magnitude)
+        # Adds a bit more weight to stronger opinions (either positive or negative)
+        intensity_weight_component = 1.0 + (abs(sentiment_score) * intensity_boost_factor)
+
+        # Combine weights (multiplicative, or choose another strategy)
+        combined_item_weight = recency_weight * intensity_weight_component
+        
+        total_weighted_score_sum += sentiment_score * combined_item_weight
+        total_weight_sum += combined_item_weight
+
+    if total_weight_sum == 0: # Avoid division by zero if no items or all weights are zero
+        logging.warning("Total weight sum is zero in weighted sentiment calculation. Returning 0.0.")
+        # Fallback: simple average if weights are zero but scores exist
+        if analyzed_details_list:
+            return sum(item['score'] for item in analyzed_details_list) / len(analyzed_details_list)
+        return 0.0
+    
+    final_weighted_score = total_weighted_score_sum / total_weight_sum
+    logging.info(f"Calculated final weighted sentiment: {final_weighted_score:.4f} from {len(analyzed_details_list)} items.")
+    return final_weighted_score
 
 
 def get_suggestion(aggregated_sentiment_score):
-    """
-    Maps aggregated sentiment score to a Buy/Sell/Hold suggestion (5 levels).
-    >>> IMPORTANT: Tune these threshold values based on testing FinBERT results! <<<
-    """
     logging.info(f"Generating suggestion based on aggregated score: {aggregated_sentiment_score:.4f}")
-    # --- Example Thresholds (MUST BE ADJUSTED) ---
-    if aggregated_sentiment_score > 0.3: # Example: Lowered threshold for FinBERT?
-        return "Strong Buy"
-    elif aggregated_sentiment_score > 0.1: # Example: Lowered threshold
-        return "Buy"
-    elif aggregated_sentiment_score >= -0.1: # Example: Adjusted neutral range
-        return "Hold"
-    elif aggregated_sentiment_score >= -0.3: # Example: Adjusted threshold
-        return "Sell"
-    else: # score < -0.3 (Example)
-        return "Strong Sell"
+    if aggregated_sentiment_score > 0.25: return "Strong Buy" # Adjusted thresholds slightly
+    elif aggregated_sentiment_score > 0.05: return "Buy"
+    elif aggregated_sentiment_score >= -0.05: return "Hold"
+    elif aggregated_sentiment_score >= -0.25: return "Sell"
+    else: return "Strong Sell"
 
-# --- Refined get_validation_points ---
 def get_validation_points(analyzed_results):
-    """
-    Selects key news headlines (most positive/negative) to justify the suggestion.
-    Includes labels in output and handles neutral case slightly better.
-    """
     if not analyzed_results:
-        logging.info("No analyzed results to generate validation points.")
-        return ["⚪️ No news data available for justification."] # Use neutral emoji
+        return ["⚪️ No content data available for justification."]
 
-    # Sort by score: descending for positive, ascending for negative
     sorted_results = sorted(analyzed_results, key=lambda x: x['score'], reverse=True)
-
     points = []
-    # Define score thresholds for "significant" sentiment
-    POSITIVE_THRESHOLD = 0.05
-    NEGATIVE_THRESHOLD = -0.05
+    POSITIVE_THRESHOLD = 0.1 # Slightly higher threshold for "significant"
+    NEGATIVE_THRESHOLD = -0.1
 
-    # Get top positive driver
+    # Top positive
     if sorted_results and sorted_results[0]['score'] > POSITIVE_THRESHOLD:
         top_pos = sorted_results[0]
-        # Include the label for clarity
-        points.append(f"🟢 **Positive:** [{top_pos['headline']}]({top_pos['url']}) (Score: {top_pos['score']:.2f}, Label: {top_pos['label']})")
+        points.append(f"🟢 **Positive ({top_pos['source_name']})**: [{top_pos['headline']}]({top_pos['url']}) (Score: {top_pos['score']:.2f})")
 
-    # Get top negative driver (from the end of the sorted list)
+    # Top negative
     if sorted_results and sorted_results[-1]['score'] < NEGATIVE_THRESHOLD:
         top_neg = sorted_results[-1]
-        # Include the label for clarity
-        # Prepend negative to list if selling suggestions are common
-        points.insert(0, f"🔴 **Negative:** [{top_neg['headline']}]({top_neg['url']}) (Score: {top_neg['score']:.2f}, Label: {top_neg['label']})")
+        points.append(f"🔴 **Negative ({top_neg['source_name']})**: [{top_neg['headline']}]({top_neg['url']}) (Score: {top_neg['score']:.2f})")
+    
+    # If only one strong point, try to add another less extreme one or a neutral one
+    if len(points) < 2 and len(sorted_results) > (1 if points else 0) :
+        if not points: # No strong points, pick most neutral or just top one
+            item = min(sorted_results, key=lambda x: abs(x['score'])) if any(abs(x['score']) < 0.05 for x in sorted_results) else sorted_results[0]
+            points.append(f"⚪️ **Neutral/Mix ({item['source_name']})**: [{item['headline']}]({item['url']}) (Score: {item['score']:.2f})")
+        # Could add logic to pick second positive/negative if one already exists
 
-    # If still need more points (e.g., only one strong driver found), add the next most relevant
-    if len(points) < 2 and len(sorted_results) > 1:
-         if points and points[0].startswith("🟢"): # If only positive found, look for second positive
-             if sorted_results[1]['score'] > POSITIVE_THRESHOLD:
-                 second_pos = sorted_results[1]
-                 points.append(f"🟢 **Positive:** [{second_pos['headline']}]({second_pos['url']}) (Score: {second_pos['score']:.2f}, Label: {second_pos['label']})")
-         elif points and points[0].startswith("🔴"): # If only negative found, look for second negative
-             if sorted_results[-2]['score'] < NEGATIVE_THRESHOLD:
-                 second_neg = sorted_results[-2]
-                 points.append(f"🔴 **Negative:** [{second_neg['headline']}]({second_neg['url']}) (Score: {second_neg['score']:.2f}, Label: {second_neg['label']})")
-
-    # Handle case where no significant positive or negative points were found
-    if not points:
-         # Find the article closest to 0 score (most neutral)
+    if not points: # Still no points (e.g., all very neutral)
          closest_neutral = min(analyzed_results, key=lambda x: abs(x['score']), default=None)
          if closest_neutral:
-              points.append(f"⚪️ **Neutral:** [{closest_neutral['headline']}]({closest_neutral['url']}) (Score: {closest_neutral['score']:.2f}, Label: {closest_neutral['label']})")
-         else: # Should not happen if analyzed_results is not empty, but safeguard
-              points.append("⚪️ **Neutral:** News sentiment appears balanced.")
-
+              points.append(f"⚪️ **Neutral ({closest_neutral['source_name']})**: [{closest_neutral['headline']}]({closest_neutral['url']}) (Score: {closest_neutral['score']:.2f})")
+         else:
+              points.append("⚪️ Sentiment appears balanced or lacks strong drivers.")
 
     logging.info(f"Generated {len(points)} validation points.")
-    return points[:3] # Return max 3 points
----------------------------------------------------
-**database.py**
-# database.py
-import sqlite3
-from config import DB_NAME
-import logging
-from datetime import datetime
-
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def get_db_connection():
-    """Establishes a connection to the SQLite database."""
-    conn = None
-    try:
-        conn = sqlite3.connect(DB_NAME, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
-        conn.row_factory = sqlite3.Row # Return rows as dictionary-like objects
-        # Enable foreign key support if using relationships
-        # conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
-    except sqlite3.Error as e:
-        logging.error(f"Error connecting to database: {e}")
-        return None
-
-def create_tables():
-    """Creates the necessary tables in the database if they don't exist."""
-    conn = get_db_connection()
-    if conn is None:
-        logging.error("Cannot create tables: Database connection failed.")
-        return
-
-    try:
-        with conn: # Use context manager for commit/rollback
-            cursor = conn.cursor()
-            # Stocks table - Basic info about tracked stocks
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS Stocks (
-                ticker TEXT PRIMARY KEY,
-                company_name TEXT,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            logging.info("Checked/Created Stocks table.")
-
-            # News Articles table - Stores fetched news data
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS NewsArticles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                headline TEXT NOT NULL,
-                source TEXT,
-                url TEXT UNIQUE NOT NULL, -- Unique URL to prevent duplicates
-                content TEXT,             -- For full article text later (Phase 2+)
-                published_at TIMESTAMP,   -- Timestamp from the source
-                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- When we fetched it
-                sentiment_score REAL,     -- Populated by analysis
-                sentiment_label TEXT,     -- e.g., 'POSITIVE', 'NEGATIVE', 'NEUTRAL'
-                FOREIGN KEY (ticker) REFERENCES Stocks (ticker)
-            );
-            """)
-            logging.info("Checked/Created NewsArticles table.")
-
-            # Add index for faster lookups
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_ticker_published ON NewsArticles (ticker, published_at DESC);")
-            logging.info("Checked/Created index on NewsArticles.")
-
-        logging.info("Database tables checked/created successfully.")
-
-    except sqlite3.Error as e:
-        logging.error(f"Error creating tables: {e}")
-    finally:
-        if conn:
-            conn.close()
-            # logging.info("Database connection closed after table creation.") # Optional log
-
-def save_stock_info(ticker, company_name):
-    """Saves or updates basic stock information."""
-    conn = get_db_connection()
-    if conn is None: return False
-
-    try:
-        with conn:
-            cursor = conn.cursor()
-            # Use INSERT OR REPLACE to handle existing tickers
-            cursor.execute("""
-                INSERT OR REPLACE INTO Stocks (ticker, company_name, last_updated)
-                VALUES (?, ?, ?)
-            """, (ticker, company_name, datetime.now()))
-            logging.info(f"Saved/Updated stock info for {ticker}")
-        return True
-    except sqlite3.Error as e:
-        logging.error(f"Error saving stock info for {ticker}: {e}")
-        return False
-    finally:
-        if conn: conn.close()
-
-def save_news_articles(ticker, articles):
-    """Saves fetched news articles to the database, avoiding duplicates based on URL."""
-    if not articles:
-        logging.warning("No articles provided to save.")
-        return 0
-
-    conn = get_db_connection()
-    if conn is None: return 0
-
-    saved_count = 0
-    articles_to_save = []
-    for article in articles:
-        # Parse timestamp string into datetime object if possible
-        published_dt = None
-        published_str = article.get('publishedAt')
-        if published_str:
-            try:
-                # Handle different possible formats, especially the 'Z' for UTC
-                published_str = published_str.replace('Z', '+00:00')
-                published_dt = datetime.fromisoformat(published_str)
-            except ValueError:
-                logging.warning(f"Could not parse timestamp: {published_str} for URL {article.get('url')}")
-
-        articles_to_save.append((
-            ticker,
-            article.get('title'),
-            article.get('source', {}).get('name'), # Safely access nested dict
-            article.get('url'),
-            published_dt # Store as datetime object
-            # Add 'content' here in Phase 2+
-        ))
-
-    try:
-        with conn:
-            cursor = conn.cursor()
-            # Use INSERT OR IGNORE to skip insertion if URL constraint is violated (duplicate)
-            cursor.executemany("""
-                INSERT OR IGNORE INTO NewsArticles (ticker, headline, source, url, published_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, articles_to_save)
-            # The rowcount gives the number of rows *affected* (inserted or updated)
-            # For INSERT OR IGNORE, it's the count of successful inserts.
-            saved_count = cursor.rowcount
-            logging.info(f"Attempted to save {len(articles_to_save)} articles for {ticker}. Successfully saved {saved_count} new articles.")
-    except sqlite3.Error as e:
-        logging.error(f"Error saving news articles for {ticker}: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-    return saved_count
-
-
-# --- Main execution block ---
-if __name__ == "__main__":
-    print(f"Initializing database '{DB_NAME}'...")
-    create_tables()
-    print("Database initialization complete.")      
--------------------------------------------------------------
+    return points[:3]
+-----------------------------------------------------------------------

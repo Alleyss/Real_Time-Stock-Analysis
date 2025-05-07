@@ -1,36 +1,32 @@
 # database.py
 import sqlite3
-from config import DB_NAME
+from config import DB_NAME # Make sure DB_NAME is correctly defined in config.py
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
 def get_db_connection():
-    """Establishes a connection to the SQLite database."""
     conn = None
     try:
         conn = sqlite3.connect(DB_NAME, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
-        conn.row_factory = sqlite3.Row # Return rows as dictionary-like objects
-        # Enable foreign key support if using relationships
-        # conn.execute("PRAGMA foreign_keys = ON;")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON;")
         return conn
     except sqlite3.Error as e:
-        logging.error(f"Error connecting to database: {e}")
+        logging.error(f"Error connecting to database '{DB_NAME}': {e}")
         return None
 
 def create_tables():
-    """Creates the necessary tables in the database if they don't exist."""
     conn = get_db_connection()
     if conn is None:
-        logging.error("Cannot create tables: Database connection failed.")
-        return
-
+        logging.critical("CRITICAL: Cannot create tables - Database connection failed.") # More severe log
+        raise ConnectionError("DB connection failed for table creation.")
     try:
-        with conn: # Use context manager for commit/rollback
+        with conn:
             cursor = conn.cursor()
-            # Stocks table - Basic info about tracked stocks
+            # Stocks table
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS Stocks (
                 ticker TEXT PRIMARY KEY,
@@ -40,51 +36,69 @@ def create_tables():
             """)
             logging.info("Checked/Created Stocks table.")
 
-            # News Articles table - Stores fetched news data
+            # NewsMediaItems Table
             cursor.execute("""
-            CREATE TABLE IF NOT EXISTS NewsArticles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS NewsMediaItems (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, -- Auto-incrementing ID
                 ticker TEXT NOT NULL,
                 headline TEXT NOT NULL,
-                source TEXT,
-                url TEXT UNIQUE NOT NULL, -- Unique URL to prevent duplicates
-                content TEXT,             -- For full article text later (Phase 2+)
-                published_at TIMESTAMP,   -- Timestamp from the source
-                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- When we fetched it
-                sentiment_score REAL,     -- Populated by analysis
-                sentiment_label TEXT,     -- e.g., 'POSITIVE', 'NEGATIVE', 'NEUTRAL'
-                FOREIGN KEY (ticker) REFERENCES Stocks (ticker)
+                url TEXT UNIQUE NOT NULL,
+                publisher_name TEXT,
+                full_text_content TEXT,
+                published_at TIMESTAMP,
+                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                sentiment_score REAL,
+                sentiment_label TEXT,
+                FOREIGN KEY (ticker) REFERENCES Stocks (ticker) ON DELETE CASCADE
             );
             """)
-            logging.info("Checked/Created NewsArticles table.")
+            logging.info("Checked/Created NewsMediaItems table.")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_newsmedia_ticker_published ON NewsMediaItems (ticker, published_at DESC);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_newsmedia_url ON NewsMediaItems (url);") # For UNIQUE constraint
 
-            # Add index for faster lookups
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_ticker_published ON NewsArticles (ticker, published_at DESC);")
-            logging.info("Checked/Created index on NewsArticles.")
+            # RedditItems Table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS RedditItems (
+                reddit_id TEXT PRIMARY KEY,     -- PRAW's submission.id or comment.id
+                ticker TEXT NOT NULL,
+                item_type TEXT NOT NULL,        -- 'post' or 'comment'
+                title_text TEXT,                -- For posts (from 'headline' in fetched item)
+                body_text_content TEXT,         -- Post selftext or comment body (from 'full_text' in fetched item)
+                url TEXT UNIQUE NOT NULL,       -- Permalink
+                subreddit_name TEXT,            -- From 'source_name' in fetched item
+                author_name TEXT,
+                item_score INTEGER,
+                num_comments_on_post INTEGER,
+                published_at TIMESTAMP,
+                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                sentiment_score REAL,
+                sentiment_label TEXT,
+                FOREIGN KEY (ticker) REFERENCES Stocks (ticker) ON DELETE CASCADE
+            );
+            """)
+            logging.info("Checked/Created RedditItems table.")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_ticker_published ON RedditItems (ticker, published_at DESC);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_url ON RedditItems (url);") # For UNIQUE constraint
 
-        logging.info("Database tables checked/created successfully.")
 
+        logging.info("All database tables checked/created successfully.")
     except sqlite3.Error as e:
-        logging.error(f"Error creating tables: {e}")
+        logging.critical(f"CRITICAL: Error creating tables: {e}", exc_info=True)
+        raise
     finally:
-        if conn:
-            conn.close()
-            # logging.info("Database connection closed after table creation.") # Optional log
+        if conn: conn.close()
 
 def save_stock_info(ticker, company_name):
-    """Saves or updates basic stock information."""
     conn = get_db_connection()
     if conn is None: return False
-
     try:
         with conn:
             cursor = conn.cursor()
-            # Use INSERT OR REPLACE to handle existing tickers
             cursor.execute("""
                 INSERT OR REPLACE INTO Stocks (ticker, company_name, last_updated)
                 VALUES (?, ?, ?)
-            """, (ticker, company_name, datetime.now()))
-            logging.info(f"Saved/Updated stock info for {ticker}")
+            """, (ticker, company_name, datetime.now(timezone.utc)))
+        logging.debug(f"Saved/Updated stock info for {ticker}")
         return True
     except sqlite3.Error as e:
         logging.error(f"Error saving stock info for {ticker}: {e}")
@@ -92,101 +106,201 @@ def save_stock_info(ticker, company_name):
     finally:
         if conn: conn.close()
 
-def save_news_articles(ticker, articles):
-    """Saves fetched news articles, including full text content if available."""
-    if not articles:
-        logging.warning("No articles provided to save.")
-        return 0
-
-    conn = get_db_connection()
-    if conn is None: return 0
-
-    saved_count = 0
-    articles_to_save = []
-    for article in articles:
-        published_dt = None
-        published_str = article.get('publishedAt')
-        if published_str:
-            try:
-                published_str = published_str.replace('Z', '+00:00')
-                published_dt = datetime.fromisoformat(published_str)
-            except ValueError:
-                logging.warning(f"Could not parse timestamp: {published_str} for URL {article.get('url')}")
-
-        # >>> Add full_text to the tuple <<<
-        articles_to_save.append((
-            ticker,
-            article.get('title'),
-            article.get('source', {}).get('name'),
-            article.get('url'),
-            article.get('full_text'), # Get the fetched full text
-            published_dt
-        ))
-
+def _parse_datetime(published_str):
+    """Helper to parse datetime strings robustly, returning timezone-aware UTC datetime or None."""
+    if not published_str: return None
     try:
-        with conn:
-            cursor = conn.cursor()
-            # >>> Update INSERT statement to include the content column <<<
-            cursor.executemany("""
-                INSERT OR IGNORE INTO NewsArticles
-                (ticker, headline, source, url, content, published_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, articles_to_save)
-            saved_count = cursor.rowcount
-            logging.info(f"Attempted to save {len(articles_to_save)} articles for {ticker}. Successfully saved {saved_count} new articles (with content).")
-    except sqlite3.Error as e:
-        logging.error(f"Error saving news articles for {ticker}: {e}")
-    finally:
-        if conn:
-            conn.close()
+        if isinstance(published_str, datetime): # If already a datetime object
+            if published_str.tzinfo is None or published_str.tzinfo.utcoffset(published_str) is None:
+                return published_str.replace(tzinfo=timezone.utc) # Assume UTC if naive
+            return published_str.astimezone(timezone.utc) # Convert to UTC if timezone-aware
 
+        # Handle ISO format strings, especially those ending with 'Z'
+        if published_str.endswith('Z'):
+            published_str = published_str[:-1] + '+00:00'
+        dt = datetime.fromisoformat(published_str)
+        
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+            return dt.replace(tzinfo=timezone.utc) # Assume UTC if naive
+        return dt.astimezone(timezone.utc) # Convert to UTC
+    except ValueError:
+        logging.warning(f"Could not parse timestamp: '{published_str}'. Storing as NULL.")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error parsing timestamp '{published_str}': {e}")
+        return None
+
+# --- Internal save functions for each table ---
+def _save_news_media_items_internal(conn, ticker_symbol, news_items):
+    tuples_to_save = []
+    for item in news_items:
+        url = item.get('url')
+        if not url: # URL is critical for news items as unique identifier
+            logging.warning(f"Skipping news item due to missing URL: {item.get('headline', 'No Headline')}")
+            continue
+        tuples_to_save.append((
+            ticker_symbol,
+            item.get('headline', 'N/A')[:500], # Limit headline length
+            url,
+            item.get('source_name'), # This maps to publisher_name
+            item.get('full_text'),   # This maps to full_text_content
+            _parse_datetime(item.get('publishedAt'))
+        ))
+    
+    saved_count = 0
+    if not tuples_to_save: return 0
+    try:
+        cursor = conn.cursor()
+        cursor.executemany("""
+            INSERT OR IGNORE INTO NewsMediaItems
+            (ticker, headline, url, publisher_name, full_text_content, published_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, tuples_to_save)
+        saved_count = cursor.rowcount
+        if saved_count > 0: logging.info(f"Saved {saved_count} new news items for {ticker_symbol}.")
+    except sqlite3.Error as e:
+        logging.error(f"DB Error saving news items for {ticker_symbol}: {e}", exc_info=True)
     return saved_count
 
-def update_article_sentiment(analyzed_results):
-    """Updates the sentiment score and label for articles already in the database."""
-    if not analyzed_results:
-        logging.warning("No analyzed results provided to update sentiment.")
-        return 0
+def _save_reddit_items_internal(conn, ticker_symbol, reddit_items):
+    tuples_to_save = []
+    for item in reddit_items:
+        reddit_native_id = item.get('id') # This is 'reddit_id' (PK)
+        url = item.get('url')
+        if not reddit_native_id or not url:
+            logging.warning(f"Skipping Reddit item due to missing 'id' or 'url': Title='{item.get('headline')}'")
+            continue
+        
+        tuples_to_save.append((
+            reddit_native_id,
+            ticker_symbol,
+            item.get('source_type', 'reddit_unknown').replace('reddit_', ''), # 'post' or 'comment'
+            item.get('title_text', item.get('headline')), # 'title_text' for DB
+            item.get('body_text_content', item.get('full_text')), # 'body_text_content' for DB
+            url,
+            item.get('source_name'), # subreddit_name
+            item.get('author_name', 'N/A'),
+            item.get('item_score', 0),
+            item.get('num_comments_on_post', 0),
+            _parse_datetime(item.get('publishedAt'))
+        ))
 
+    saved_count = 0
+    if not tuples_to_save: return 0
+    try:
+        cursor = conn.cursor()
+        cursor.executemany("""
+            INSERT OR IGNORE INTO RedditItems
+            (reddit_id, ticker, item_type, title_text, body_text_content, url, subreddit_name, author_name, item_score, num_comments_on_post, published_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, tuples_to_save)
+        saved_count = cursor.rowcount
+        if saved_count > 0: logging.info(f"Saved {saved_count} new Reddit items for {ticker_symbol}.")
+    except sqlite3.Error as e:
+        logging.error(f"DB Error saving Reddit items for {ticker_symbol}: {e}", exc_info=True)
+    return saved_count
+
+
+# --- Public function to save content (this is what app.py imports) ---
+def save_content_items(ticker_symbol, content_items_list):
+    """
+    Routes content items to their respective internal save functions based on 'source_type'.
+    """
+    if not content_items_list: return 0
     conn = get_db_connection()
     if conn is None: return 0
 
-    updates_to_perform = []
-    for result in analyzed_results:
-        url = result.get('url')
-        score = result.get('score') # This is the normalized [-1, 1] score
-        label = result.get('label') # This is 'positive', 'negative', 'neutral'
+    news_to_save, reddit_to_save = [], []
+    for item in content_items_list:
+        source_type = item.get('source_type', 'unknown').lower()
+        if 'news' in source_type: news_to_save.append(item)
+        elif 'reddit' in source_type: reddit_to_save.append(item)
+        else: logging.warning(f"Unknown source_type '{source_type}' for item URL: {item.get('url')}")
 
-        if url is not None and score is not None and label is not None:
-            updates_to_perform.append((score, label, url))
+    total_saved_count = 0
+    try:
+        with conn: # Use a single transaction for all saves
+            if news_to_save:
+                total_saved_count += _save_news_media_items_internal(conn, ticker_symbol, news_to_save)
+            if reddit_to_save:
+                total_saved_count += _save_reddit_items_internal(conn, ticker_symbol, reddit_to_save)
+       
+        if total_saved_count > 0:
+            logging.info(f"Successfully saved a total of {total_saved_count} items to DB for {ticker_symbol}.")
+    except sqlite3.Error as e: # Catch transaction-level errors if any
+        logging.error(f"Transaction error during save_content_items for {ticker_symbol}: {e}", exc_info=True)
+    finally:
+        if conn: conn.close() # Ensure connection is closed even if transaction context manager was used.
+    
+    return total_saved_count
+
+
+def update_sentiment_for_items(analyzed_results_list):
+    """Updates sentiment for items in their respective tables using their source-specific ID or URL."""
+    if not analyzed_results_list: return 0
+    conn = get_db_connection()
+    if conn is None: return 0
+
+    updates_by_table = {'NewsMediaItems': [], 'RedditItems': []}
+    # Define the ID column used in the WHERE clause for each table
+    id_column_map = {'NewsMediaItems': 'url', 'RedditItems': 'reddit_id'}
+
+    for result in analyzed_results_list:
+        score = result.get('score')
+        label = result.get('label')
+        source_type = result.get('source_type', 'unknown').lower()
+        item_identifier = result.get('source_specific_id') # Should be populated by sentiment_analyzer
+        
+        table_name = None
+        id_column_name = None
+
+        if 'news' in source_type:
+            table_name = 'NewsMediaItems'
+            id_column_name = id_column_map[table_name]
+            # For news, source_specific_id in analyzed_results should be the URL
+            if not item_identifier: item_identifier = result.get('url') 
+        elif 'reddit' in source_type:
+            table_name = 'RedditItems'
+            id_column_name = id_column_map[table_name]
+            id_column_name = id_column_map[table_name]
         else:
-            logging.warning(f"Skipping sentiment update for item due to missing data: URL={url}, Score={score}, Label={label}")
+            logging.warning(f"Cannot update sentiment for unknown source_type: {source_type}")
+            continue
 
-    if not updates_to_perform:
-        logging.warning("No valid data found in analyzed_results for sentiment update.")
-        return 0
+        if table_name and item_identifier is not None and score is not None and label is not None:
+            updates_by_table[table_name].append((score, label, item_identifier))
+        else:
+            logging.warning(f"Skipping sentiment update due to missing data: ID={item_identifier}, Score={score}, Label={label} for {source_type}")
 
-    updated_count = 0
+    total_updated_count = 0
     try:
         with conn:
             cursor = conn.cursor()
-            # Prepare and execute the UPDATE statement
-            cursor.executemany("""
-                UPDATE NewsArticles
-                SET sentiment_score = ?, sentiment_label = ?
-                WHERE url = ?
-            """, updates_to_perform)
-            updated_count = cursor.rowcount # Number of rows actually updated
-            logging.info(f"Attempted to update sentiment for {len(updates_to_perform)} articles. Successfully updated {updated_count} rows.")
+            for table_name, updates in updates_by_table.items():
+                if updates:
+                    id_col_for_where = id_column_map[table_name]
+                    # Only update if sentiment_score is currently NULL (avoid re-processing)
+                    # Or remove "AND sentiment_score IS NULL" to always update.
+                    sql = f""" 
+                        UPDATE {table_name}
+                        SET sentiment_score = ?, sentiment_label = ?
+                        WHERE {id_col_for_where} = ? AND (sentiment_score IS NULL OR sentiment_label IS NULL)
+                    """
+                    try:
+                        cursor.executemany(sql, updates)
+                        updated_for_table = cursor.rowcount
+                        if updated_for_table > 0:
+                            logging.info(f"Updated sentiment for {updated_for_table} items in {table_name}.")
+                        total_updated_count += updated_for_table
+                    except sqlite3.Error as e_table:
+                        logging.error(f"Error updating {table_name}: {e_table}. Updates: {updates[:2]}") # Log first few failing updates
     except sqlite3.Error as e:
-        logging.error(f"Error updating article sentiments in database: {e}")
+        logging.error(f"Transaction error during update_sentiment_for_items: {e}", exc_info=True)
     finally:
-        if conn:
-            conn.close()
+        if conn: conn.close()
+    return total_updated_count
 
-    return updated_count
-# --- Main execution block ---
 if __name__ == "__main__":
     print(f"Initializing database '{DB_NAME}'...")
-    create_tables()
-    print("Database initialization complete.")      
+    create_tables() # This will also create indexes
+    print("Database initialization complete.")
