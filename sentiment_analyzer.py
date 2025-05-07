@@ -35,70 +35,88 @@ def get_sentiment_pipeline(model_name=DEFAULT_SENTIMENT_MODEL):
         logging.error(f"Error loading sentiment model '{model_name}': {e}", exc_info=True)
         return None
 
-
 def analyze_sentiment_for_ticker(news_articles, sentiment_pipeline):
     """
-    Analyzes sentiment for a list of news articles (headlines initially)
-    using the provided (and cached) sentiment pipeline.
+    Analyzes sentiment for a list of news articles using full text if available,
+    otherwise falling back to the headline.
     """
     if not news_articles:
         logging.warning("No news articles provided for sentiment analysis.")
-        return 0.0, [] # Return neutral score and empty details
+        return 0.0, []
 
     if sentiment_pipeline is None:
         logging.error("Sentiment pipeline is not available. Cannot analyze.")
         return 0.0, []
 
-    logging.info(f"Analyzing sentiment for {len(news_articles)} articles...")
+    logging.info(f"Analyzing sentiment for {len(news_articles)} articles (using full text where available)...")
     analyzed_results = []
     total_score = 0.0
     analyzed_count = 0
 
-    headlines = [article.get('title', '') for article in news_articles if article.get('title')]
-    urls = [article.get('url', '') for article in news_articles if article.get('title')] # Keep track of urls
+    # --- Prepare texts for analysis ---
+    texts_to_analyze = []
+    original_indices = [] # Keep track of which article corresponds to which text
+    analysis_source = [] # Track if title or full_text was used
 
-    if not headlines:
-        logging.warning("No valid headlines found in the provided articles.")
+    for i, article in enumerate(news_articles):
+        full_text = article.get('full_text')
+        title = article.get('title')
+
+        # Prioritize full_text if it exists and has substance
+        if full_text and len(full_text) > len(title or ''): # Use full text if longer than title
+            texts_to_analyze.append(full_text)
+            analysis_source.append('full_text')
+        elif title: # Fallback to title if full_text is missing or short
+            texts_to_analyze.append(title)
+            analysis_source.append('title')
+        else:
+            continue # Skip if neither title nor full_text is usable
+
+        original_indices.append(i) # Store the index of the original article
+
+    if not texts_to_analyze:
+        logging.warning("No valid text (title or full_text) found in the provided articles to analyze.")
         return 0.0, []
 
     try:
-        # Process headlines in batches for potentially better performance
-        # The pipeline handles batching internally if you pass a list
-        results = sentiment_pipeline(headlines, truncation=True, max_length=512) # Add truncation
+        # --- Process texts in batches ---
+        # Ensure truncation is enabled as full articles can be long
+        logging.info(f"Running pipeline on {len(texts_to_analyze)} text pieces...")
+        results = sentiment_pipeline(texts_to_analyze, truncation=True, max_length=512) # FinBERT's default max_length is 512
+        logging.info("Pipeline processing complete.")
 
         for i, result in enumerate(results):
-            score = result['score']
-            label = result['label'].lower() # Normalize label to lowercase for consistency
-            headline = headlines[i]
-            url = urls[i]
+            original_article_index = original_indices[i]
+            original_article = news_articles[original_article_index] # Get the original article dict
+            source_used = analysis_source[i] # Know what was analyzed
 
-            # --- Score Normalization ---
-            # Convert label/score to a single score in range [-1, 1]
-            # Assumes 'POSITIVE'/'NEGATIVE' labels from distilbert-sst2
-            # Adjust if using a model with different labels (e.g., POSITIVE/NEGATIVE/NEUTRAL or numeric labels)
+            score = result['score']
+            label = result['label'].lower() # Normalize label
+
+            # --- Score Normalization (Adjust for FinBERT labels) ---
+            # FinBERT typically outputs 'positive', 'negative', 'neutral'
             if label == 'positive':
                 normalized_score = score
             elif label == 'negative':
                 normalized_score = -score
             elif label == 'neutral':
-                normalized_score = 0.0
-            else: # Handle potential 'NEUTRAL' or other labels if model changes
+                normalized_score = 0.0 # Neutral score
+            else:
                  logging.warning(f"Unexpected sentiment label '{label}' for model. Treating as neutral (0.0).")
                  normalized_score = 0.0
 
             analyzed_results.append({
-                'headline': headline,
-                'url': url, # Include URL for linking
-                'score': normalized_score, # Store the [-1, 1] score
-                'label': label # Store the original label
+                'headline': original_article.get('title', 'N/A'), # Still store headline for display
+                'url': original_article.get('url'),
+                'score': normalized_score,
+                'label': label,
+                'analyzed_source': source_used # Store whether title or full_text was used
             })
             total_score += normalized_score
             analyzed_count += 1
 
     except Exception as e:
         logging.error(f"Error during batch sentiment analysis: {e}", exc_info=True)
-        # Fallback to individual analysis if batch fails (optional)
-        # ... (implement fallback loop here if needed) ...
 
     if analyzed_count > 0:
         aggregated_score = total_score / analyzed_count
@@ -108,8 +126,7 @@ def analyze_sentiment_for_ticker(news_articles, sentiment_pipeline):
         logging.warning("No articles were successfully analyzed.")
 
     return aggregated_score, analyzed_results
-
-
+    
 def get_suggestion(aggregated_sentiment_score):
     """
     Maps aggregated sentiment score to a Buy/Sell/Hold suggestion (5 levels).

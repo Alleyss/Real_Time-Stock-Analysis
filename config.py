@@ -25,3 +25,8 @@ DEFAULT_SENTIMENT_MODEL = "ProsusAI/finbert"
 # --- Other Constants ---
 # Number of news articles to fetch/analyze
 NEWS_ARTICLE_COUNT = 20 # Adjust as needed (consider NewsAPI limits)
+MIN_ARTICLE_LENGTH_FOR_ANALYSIS = 200 # Min characters for full_text to be considered substantial
+MIN_TICKER_MENTIONS_FOR_RELEVANCE = 2 # Min times ticker/company name should appear in full_text
+RECENCY_DECAY_HALF_LIFE_HOURS = 24.0
+# Intensity boost: score_weight = 1 + abs(sentiment_score) * INTENSITY_BOOST_FACTOR
+INTENSITY_BOOST_FACTOR = 0.2

@@ -6,3 +6,6 @@ beautifulsoup4
 transformers 
 torch 
 python-dotenv
+newspaper3k
+praw 
+snscrape

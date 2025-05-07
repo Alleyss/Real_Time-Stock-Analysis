@@ -93,7 +93,7 @@ def save_stock_info(ticker, company_name):
         if conn: conn.close()
 
 def save_news_articles(ticker, articles):
-    """Saves fetched news articles to the database, avoiding duplicates based on URL."""
+    """Saves fetched news articles, including full text content if available."""
     if not articles:
         logging.warning("No articles provided to save.")
         return 0
@@ -104,38 +104,36 @@ def save_news_articles(ticker, articles):
     saved_count = 0
     articles_to_save = []
     for article in articles:
-        # Parse timestamp string into datetime object if possible
         published_dt = None
         published_str = article.get('publishedAt')
         if published_str:
             try:
-                # Handle different possible formats, especially the 'Z' for UTC
                 published_str = published_str.replace('Z', '+00:00')
                 published_dt = datetime.fromisoformat(published_str)
             except ValueError:
                 logging.warning(f"Could not parse timestamp: {published_str} for URL {article.get('url')}")
 
+        # >>> Add full_text to the tuple <<<
         articles_to_save.append((
             ticker,
             article.get('title'),
-            article.get('source', {}).get('name'), # Safely access nested dict
+            article.get('source', {}).get('name'),
             article.get('url'),
-            published_dt # Store as datetime object
-            # Add 'content' here in Phase 2+
+            article.get('full_text'), # Get the fetched full text
+            published_dt
         ))
 
     try:
         with conn:
             cursor = conn.cursor()
-            # Use INSERT OR IGNORE to skip insertion if URL constraint is violated (duplicate)
+            # >>> Update INSERT statement to include the content column <<<
             cursor.executemany("""
-                INSERT OR IGNORE INTO NewsArticles (ticker, headline, source, url, published_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO NewsArticles
+                (ticker, headline, source, url, content, published_at)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, articles_to_save)
-            # The rowcount gives the number of rows *affected* (inserted or updated)
-            # For INSERT OR IGNORE, it's the count of successful inserts.
             saved_count = cursor.rowcount
-            logging.info(f"Attempted to save {len(articles_to_save)} articles for {ticker}. Successfully saved {saved_count} new articles.")
+            logging.info(f"Attempted to save {len(articles_to_save)} articles for {ticker}. Successfully saved {saved_count} new articles (with content).")
     except sqlite3.Error as e:
         logging.error(f"Error saving news articles for {ticker}: {e}")
     finally:
@@ -144,7 +142,49 @@ def save_news_articles(ticker, articles):
 
     return saved_count
 
+def update_article_sentiment(analyzed_results):
+    """Updates the sentiment score and label for articles already in the database."""
+    if not analyzed_results:
+        logging.warning("No analyzed results provided to update sentiment.")
+        return 0
 
+    conn = get_db_connection()
+    if conn is None: return 0
+
+    updates_to_perform = []
+    for result in analyzed_results:
+        url = result.get('url')
+        score = result.get('score') # This is the normalized [-1, 1] score
+        label = result.get('label') # This is 'positive', 'negative', 'neutral'
+
+        if url is not None and score is not None and label is not None:
+            updates_to_perform.append((score, label, url))
+        else:
+            logging.warning(f"Skipping sentiment update for item due to missing data: URL={url}, Score={score}, Label={label}")
+
+    if not updates_to_perform:
+        logging.warning("No valid data found in analyzed_results for sentiment update.")
+        return 0
+
+    updated_count = 0
+    try:
+        with conn:
+            cursor = conn.cursor()
+            # Prepare and execute the UPDATE statement
+            cursor.executemany("""
+                UPDATE NewsArticles
+                SET sentiment_score = ?, sentiment_label = ?
+                WHERE url = ?
+            """, updates_to_perform)
+            updated_count = cursor.rowcount # Number of rows actually updated
+            logging.info(f"Attempted to update sentiment for {len(updates_to_perform)} articles. Successfully updated {updated_count} rows.")
+    except sqlite3.Error as e:
+        logging.error(f"Error updating article sentiments in database: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    return updated_count
 # --- Main execution block ---
 if __name__ == "__main__":
     print(f"Initializing database '{DB_NAME}'...")

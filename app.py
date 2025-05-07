@@ -6,11 +6,12 @@ from datetime import datetime, timedelta
 
 # Import functions from other modules
 from config import DEFAULT_SENTIMENT_MODEL
-from database import create_tables, save_stock_info, save_news_articles
+from database import create_tables, save_stock_info, save_news_articles,update_article_sentiment
 from data_fetcher import get_stock_info, get_us_news, scrape_indian_news
 from sentiment_analyzer import (
     get_sentiment_pipeline, # Import the loader helper
     analyze_sentiment_for_ticker,
+    
     get_suggestion,
     get_validation_points
 )
@@ -93,12 +94,17 @@ if analyze_button and ticker_input:
                 # 4. Analyze Sentiment
                 logging.info(f"[Workflow] Running sentiment analysis...")
                 aggregated_score, analyzed_details = analyze_sentiment_for_ticker(news_articles, sentiment_pipeline)
-
-            # 5. Get Suggestion
+                # 5. <<< Update Database with Sentiment >>>
+                if analyzed_details: # Only update if analysis produced results
+                     logging.info(f"[Workflow] Updating database with sentiment scores for {len(analyzed_details)} articles.")
+                     update_article_sentiment(analyzed_details) # Call the new function
+                else:
+                     logging.warning("[Workflow] No analysis details generated, skipping sentiment update in DB.")
+            # 6. Get Suggestion
             logging.info(f"[Workflow] Generating suggestion...")
             suggestion = get_suggestion(aggregated_score)
 
-            # 6. Get Validation Points
+            # 7. Get Validation Points
             logging.info(f"[Workflow] Extracting validation points...")
             validation_points = get_validation_points(analyzed_details) # Pass detailed results
 
