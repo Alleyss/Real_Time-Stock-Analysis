@@ -1,0 +1,1079 @@
+Router Files:
+app/api/routers/auth.py
+# app/api/routers/auth.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm # Standard form for username/password
+from sqlalchemy.orm import Session
+
+from app.db.database import get_db
+from app.schemas import user as user_schemas
+from app.schemas import token as token_schemas
+from app.crud import crud_user
+from app.core import security
+from app.core.config import settings
+from app.api import deps # Import your dependencies
+
+router = APIRouter()
+
+@router.post("/register", response_model=user_schemas.User) # Or /signup
+def register_user(
+    *, # Enforces keyword-only arguments after this
+    db: Session = Depends(get_db),
+    user_in: user_schemas.UserCreate,
+):
+    """
+    Create new user.
+    """
+    user = crud_user.get_user_by_email(db, email=user_in.email)
+    if user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The user with this email already exists in the system.",
+        )
+    if user_in.username: # If username is provided, check if it exists
+        user_by_username = crud_user.get_user_by_username(db, username=user_in.username)
+        if user_by_username:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The user with this username already exists in the system.",
+            )
+            
+    new_user = crud_user.create_user(db=db, user=user_in)
+    return new_user
+
+
+@router.post("/token", response_model=token_schemas.Token) # Or /login
+async def login_for_access_token(
+    db: Session = Depends(get_db),
+    form_data: OAuth2PasswordRequestForm = Depends() # FastAPI injects form data
+):
+    """
+    OAuth2 compatible token login, get an access token for future requests.
+    Username in OAuth2PasswordRequestForm will be the email.
+    """
+    # form_data.username will contain the email entered by the user
+    user = crud_user.get_user_by_email(db, email=form_data.username) 
+    if not user or not security.verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    
+    access_token = security.create_access_token(
+        subject=user.email # Use email as the JWT subject
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Example of a protected endpoint
+@router.get("/me", response_model=user_schemas.User)
+async def read_users_me(
+    current_user: user_schemas.User = Depends(deps.get_current_active_user)
+):
+    """
+    Get current logged-in user.
+    """
+    return current_user
+app/api/routers/wishlist.py
+# app/api/routers/wishlist.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from typing import List # For List response model
+
+from app.db.database import get_db
+from app.schemas import wishlist as wishlist_schemas # Your Pydantic wishlist schemas
+from app.db import models as db_models # Your SQLAlchemy models
+from app.crud import crud_wishlist # Your wishlist CRUD functions
+from app.api import deps # Your dependencies, especially get_current_active_user
+
+router = APIRouter()
+
+@router.post("/", response_model=wishlist_schemas.WishlistItem, status_code=status.HTTP_201_CREATED)
+def add_stock_to_wishlist(
+    *,
+    db: Session = Depends(get_db),
+    item_in: wishlist_schemas.WishlistItemCreate,
+    current_user: db_models.User = Depends(deps.get_current_active_user)
+):
+    """
+    Add a stock to the current user's wishlist.
+    """
+    # Convert ticker to uppercase for consistent checking and storage
+    ticker_upper = item_in.ticker_symbol.upper()
+    
+    existing_item = crud_wishlist.get_wishlist_item(db, user_id=current_user.id, ticker_symbol=ticker_upper)
+    if existing_item:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Ticker {ticker_upper} is already in your wishlist."
+        )
+    
+    # Update item_in with uppercase ticker before passing to CRUD
+    item_in_processed = wishlist_schemas.WishlistItemCreate(ticker_symbol=ticker_upper)
+    wishlist_item = crud_wishlist.add_item_to_wishlist(db=db, item=item_in_processed, user_id=current_user.id)
+    return wishlist_item
+
+@router.get("/", response_model=List[wishlist_schemas.WishlistItem]) # Return a list of items
+def read_user_wishlist(
+    *,
+    db: Session = Depends(get_db),
+    skip: int = 0,
+    limit: int = 100,
+    current_user: db_models.User = Depends(deps.get_current_active_user)
+):
+    """
+    Retrieve the current user's wishlist.
+    """
+    wishlist_items = crud_wishlist.get_wishlist_items_by_user(db, user_id=current_user.id, skip=skip, limit=limit)
+    return wishlist_items
+
+@router.delete("/{ticker_symbol}", response_model=wishlist_schemas.WishlistItem)
+def remove_stock_from_wishlist(
+    *,
+    db: Session = Depends(get_db),
+    ticker_symbol: str,
+    current_user: db_models.User = Depends(deps.get_current_active_user)
+):
+    """
+    Remove a stock from the current user's wishlist.
+    """
+    # Convert ticker to uppercase for consistent checking
+    ticker_upper = ticker_symbol.upper()
+    
+    deleted_item = crud_wishlist.remove_item_from_wishlist(db, user_id=current_user.id, ticker_symbol=ticker_upper)
+    if not deleted_item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ticker {ticker_upper} not found in your wishlist."
+        )
+    return deleted_item
+
+# Optional: Get a specific wishlist item (might not be needed if GET / already returns enough detail)
+@router.get("/{ticker_symbol}", response_model=wishlist_schemas.WishlistItem)
+def read_specific_wishlist_item(
+    *,
+    db: Session = Depends(get_db),
+    ticker_symbol: str,
+    current_user: db_models.User = Depends(deps.get_current_active_user)
+):
+    """
+    Check if a specific stock is in the current user's wishlist.
+    """
+    ticker_upper = ticker_symbol.upper()
+    item = crud_wishlist.get_wishlist_item(db, user_id=current_user.id, ticker_symbol=ticker_upper)
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ticker {ticker_upper} not found in your wishlist."
+        )
+    return item
+app/api/routers/stocks.py
+These are crucial as they define your API endpoints, their request/response models 
+(schemas), and how they interact with CRUD operations and services.
+# app/api/routers/stocks.py
+from fastapi import APIRouter, HTTPException, Depends, Query, status
+from typing import Optional, List
+import logging
+
+# Import services and schemas
+from app.services import data_fetcher_service, sentiment_service
+from app.schemas import stock as stock_schemas
+from app.core.config import settings
+# Import the Enum if created separately
+from app.schemas.common import SentimentDataSource # Assuming you created common.py
+
+log = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# --- /info endpoint remains the same ---
+@router.get("/{ticker_symbol}/info", response_model=stock_schemas.StockInfo)
+async def get_stock_information(ticker_symbol: str):
+    """
+    Retrieve basic stock information for a given ticker symbol using yfinance.
+    """
+    log.info(f"Received request for stock info: {ticker_symbol}")
+    stock_data = data_fetcher_service.fetch_stock_info(ticker_symbol.upper())
+    if not stock_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Could not retrieve stock information for ticker '{ticker_symbol}'. Please check the symbol."
+        )
+    return stock_data
+
+# --- Modified /sentiment endpoint ---
+@router.get("/{ticker_symbol}/sentiment", response_model=stock_schemas.SentimentAnalysisResult)
+async def get_stock_sentiment(
+    ticker_symbol: str,
+    # Use Query parameter with Enum for validation
+    source: SentimentDataSource = Query(
+        ..., # Ellipsis makes it a required parameter
+        description="Specify the data source to analyze ('news' or 'reddit')."
+    )
+):
+    """
+    Fetch content for a specific source (News or Reddit), analyze sentiment,
+    and return results for the given ticker.
+    """
+    ticker_upper = ticker_symbol.upper()
+    log.info(f"Received request for '{source.value}' sentiment analysis: {ticker_upper}") # Use source.value
+
+    # 1. Get Company Name (use stock info or fallback)
+    stock_info = data_fetcher_service.fetch_stock_info(ticker_upper)
+    if not stock_info or not stock_info.get("company_name"):
+        log.warning(f"Could not get company name for {ticker_upper}. Using ticker.")
+        company_name = ticker_upper
+    else:
+        company_name = stock_info["company_name"]
+
+    # 2. Fetch Content based on the 'source' parameter
+    fetched_content = []
+    data_source_description = "" # For the response object
+
+    if source == SentimentDataSource.NEWS:
+        data_source_description = "News"
+        log.info(f"Fetching news data for {ticker_upper}...")
+        fetched_content = data_fetcher_service.fetch_news_data_service(ticker_upper, company_name)
+    elif source == SentimentDataSource.REDDIT:
+        data_source_description = "Reddit"
+        log.info(f"Fetching reddit data for {ticker_upper}...")
+        fetched_content = data_fetcher_service.fetch_reddit_data_service(ticker_upper, company_name)
+    else:
+        # Should not happen if Enum is used correctly, but good practice
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid data source specified: {source}. Use 'news' or 'reddit'."
+        )
+
+    if not fetched_content:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No relevant content found for ticker '{ticker_upper}' from source '{data_source_description}'."
+        )
+
+    # 3. Analyze Sentiment (Service is the same)
+    log.info(f"Analyzing sentiment for {len(fetched_content)} items from {data_source_description} for {ticker_upper}...")
+    analyzed_details = sentiment_service.analyze_content_sentiment(fetched_content)
+    if not analyzed_details:
+         raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Sentiment analysis failed to produce results for '{ticker_upper}' from source '{data_source_description}'."
+        )
+
+    # 4. Calculate Final Score, Suggestion, Validation Points (Services are the same)
+    final_score = sentiment_service.calculate_final_sentiment_score(analyzed_details)
+    suggestion = sentiment_service.get_sentiment_suggestion(final_score)
+    validation_points_raw = sentiment_service.extract_validation_points(analyzed_details)
+    validation_points_schema = [stock_schemas.JustificationPoint(**point) for point in validation_points_raw]
+
+    # 5. Prepare Response
+    response = stock_schemas.SentimentAnalysisResult(
+        ticker=ticker_upper,
+        company_name=company_name,
+        data_source=data_source_description, # <<< Use the specific source description
+        aggregated_score=final_score,
+        suggestion=suggestion,
+        analyzed_articles_count=len(analyzed_details),
+        justification_points=validation_points_schema,
+        top_analyzed_items=analyzed_details[:15] # Return top 15 analyzed items
+    )
+
+    return response
+Schema Files (Pydantic models):
+app/schemas/user.py
+# app/schemas/user.py
+from pydantic import BaseModel, EmailStr, Field
+from datetime import datetime
+from typing import Optional # Use Optional for Python 3.9+ if not using | None syntax
+
+# Shared properties for user input
+class UserBase(BaseModel):
+    email: EmailStr
+    username: Optional[str] = Field(None, min_length=3, max_length=50) # Example constraints
+
+# Properties to receive via API on creation
+class UserCreate(UserBase):
+    password: str = Field(..., min_length=8) # Password is required and must be at least 8 chars
+
+# Properties to receive via API on update (not used in auth step, but good to have)
+class UserUpdate(UserBase):
+    password: Optional[str] = Field(None, min_length=8)
+
+# Properties shared by models stored in DB - this is what we return FROM the DB
+class UserInDBBase(UserBase):
+    id: int
+    is_active: bool
+    created_at: datetime
+    # Pydantic V2: from_attributes = True for ORM mode
+    # Pydantic V1: class Config: orm_mode = True
+    model_config = {"from_attributes": True}
+
+
+# Additional properties to return to client
+class User(UserInDBBase):
+    pass # No extra fields for now
+
+# Additional properties stored in DB but not usually returned to client
+class UserInDB(UserInDBBase):
+    hashed_password: str
+app/schemas/token.py
+# app/schemas/token.py
+from pydantic import BaseModel
+from typing import Optional # Or use `str | None` for Python 3.10+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    # This will store the identifier from the JWT (e.g., username or email)
+    identifier: Optional[str] = None
+app/schemas/wishlist.py (if you created one, or if it's part of stock.py)
+# app/schemas/wishlist.py
+from pydantic import BaseModel, Field
+from datetime import datetime
+from typing import Optional
+
+# Properties to receive when adding an item to the wishlist
+class WishlistItemCreate(BaseModel):
+    ticker_symbol: str = Field(..., examples=["AAPL"], description="Stock ticker symbol to add to wishlist")
+
+# Properties of a wishlist item as stored in DB and returned to client
+class WishlistItemBase(BaseModel):
+    id: int
+    ticker_symbol: str
+    added_at: datetime
+    # Pydantic V2: from_attributes = True for ORM mode
+    model_config = {"from_attributes": True}
+
+
+class WishlistItem(WishlistItemBase):
+    pass # No extra fields for now
+
+# For returning a list of wishlist items
+class Wishlist(BaseModel):
+    items: list[WishlistItem]
+    total: int
+app/schemas/stock.py (or sentiment.py - for stock info and sentiment analysis results)
+These define the data structures for your API.
+# app/schemas/stock.py
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any, Dict # Use Optional or | None
+
+# --- Stock Info Schemas ---
+class StockInfoBase(BaseModel):
+    symbol: str
+    company_name: str
+    current_price: float | str | None # Allow float, string "N/A", or None
+    currency: Optional[str] = None
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    market_cap: Optional[int] = None
+    error: Optional[str] = None # For returning info about data issues
+
+class StockInfo(StockInfoBase):
+    # Potentially add more fields or the raw yfinance info if needed
+    # info_raw: Optional[Dict[str, Any]] = None
+    pass
+
+# --- Sentiment Analysis Schemas ---
+class AnalyzedItem(BaseModel):
+    headline: Optional[str] = None
+    url: Optional[str] = None
+    score: float
+    label: str
+    publishedAt: Optional[str] = None # Keep as string from source
+    source_name: Optional[str] = None
+    source_type: Optional[str] = None
+
+class JustificationPoint(BaseModel):
+    type: str # 'positive', 'negative', 'neutral'
+    headline: Optional[str] = None
+    url: Optional[str] = None
+    source: Optional[str] = None
+    score: Optional[float] = None
+
+class SentimentAnalysisResult(BaseModel):
+    ticker: str
+    company_name: str
+    data_source: str # e.g., "News", "Reddit", "Combined"
+    aggregated_score: float
+    suggestion: str
+    analyzed_articles_count: int
+    justification_points: List[JustificationPoint] = []
+    # Optionally include top N analyzed articles details
+    top_analyzed_items: List[AnalyzedItem] = []
+CRUD Operation Files:
+app/crud/crud_user.py
+# app/crud/crud_user.py
+from sqlalchemy.orm import Session
+from app.db import models # Import your SQLAlchemy models
+from app.schemas import user as user_schemas # Import your Pydantic user schemas
+from app.core.security import get_password_hash
+
+def get_user(db: Session, user_id: int) -> models.User | None:
+    return db.query(models.User).filter(models.User.id == user_id).first()
+
+def get_user_by_email(db: Session, email: str) -> models.User | None:
+    return db.query(models.User).filter(models.User.email == email).first()
+
+def get_user_by_username(db: Session, username: str) -> models.User | None:
+    return db.query(models.User).filter(models.User.username == username).first()
+
+def get_users(db: Session, skip: int = 0, limit: int = 100) -> list[models.User]:
+    return db.query(models.User).offset(skip).limit(limit).all()
+
+def create_user(db: Session, user: user_schemas.UserCreate) -> models.User:
+    hashed_password = get_password_hash(user.password)
+    db_user = models.User(
+        email=user.email,
+        username=user.username, # Make sure username is handled if optional
+        hashed_password=hashed_password
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user) # Refresh to get DB-generated values like ID, created_at
+    return db_user
+
+def update_user(db: Session, db_user: models.User, user_in: user_schemas.UserUpdate) -> models.User:
+    user_data = user_in.model_dump(exclude_unset=True) # Pydantic V2, V1: user_in.dict(...)
+    if "password" in user_data and user_data["password"]: # If password is provided for update
+        hashed_password = get_password_hash(user_data["password"])
+        db_user.hashed_password = hashed_password
+    
+    # Update other fields
+    if "email" in user_data:
+        db_user.email = user_data["email"]
+    if "username" in user_data:
+        db_user.username = user_data["username"]
+    if "is_active" in user_data: # Example if you add is_active to UserUpdate
+        db_user.is_active = user_data["is_active"]
+        
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+# Add activate/deactivate user functions if needed
+# def activate_user(db: Session, db_user: models.User) -> models.User: ...
+# def deactivate_user(db: Session, db_user: models.User) -> models.User: ...
+app/crud/crud_wishlist.py (or crud_stock.py if combined)
+# app/crud/crud_wishlist.py
+from sqlalchemy.orm import Session
+from app.db import models # Your SQLAlchemy models (User, WishlistItem)
+from app.schemas import wishlist as wishlist_schemas # Your Pydantic wishlist schemas
+
+def get_wishlist_item(db: Session, user_id: int, ticker_symbol: str) -> models.WishlistItem | None:
+    """
+    Get a specific wishlist item for a user by ticker symbol.
+    """
+    return db.query(models.WishlistItem).filter(
+        models.WishlistItem.user_id == user_id,
+        models.WishlistItem.ticker_symbol == ticker_symbol.upper() # Store/check tickers consistently (e.g., uppercase)
+    ).first()
+
+def get_wishlist_items_by_user(db: Session, user_id: int, skip: int = 0, limit: int = 100) -> list[models.WishlistItem]:
+    """
+    Get all wishlist items for a specific user.
+    """
+    return db.query(models.WishlistItem).filter(models.WishlistItem.user_id == user_id).offset(skip).limit(limit).all()
+
+def add_item_to_wishlist(db: Session, item: wishlist_schemas.WishlistItemCreate, user_id: int) -> models.WishlistItem:
+    """
+    Add a new stock ticker to a user's wishlist.
+    Ensures ticker is stored in uppercase.
+    """
+    db_item = models.WishlistItem(
+        ticker_symbol=item.ticker_symbol.upper(), # Store consistently
+        user_id=user_id
+    )
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+def remove_item_from_wishlist(db: Session, user_id: int, ticker_symbol: str) -> models.WishlistItem | None:
+    """
+    Remove a stock ticker from a user's wishlist.
+    Returns the item that was deleted, or None if not found.
+    """
+    db_item = get_wishlist_item(db, user_id=user_id, ticker_symbol=ticker_symbol.upper())
+    if db_item:
+        db.delete(db_item)
+        db.commit()
+        return db_item
+    return None
+These show how you're interacting with the database for these entities.
+Database Model File:
+app/db/models.py (To see the exact SQLAlchemy models for User, WishlistItem, and any others you might have added for caching/persisting stock/sentiment data).
+# app/db/models.py
+from sqlalchemy import Column, Integer, String, DateTime, Float, ForeignKey, Boolean
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func # For server-side default timestamps
+from app.db.database import Base # Import Base from our database.py
+from datetime import datetime
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    # Username can be optional or made unique and required like email
+    username = Column(String, unique=True, index=True, nullable=True)
+    hashed_password = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True) # For deactivating accounts
+    
+    # Using server_default=func.now() makes the DB handle timestamp generation
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # onupdate=func.now() updates the timestamp automatically on record update
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relationship to WishlistItems
+    # 'back_populates' links this relationship to the 'owner' attribute in WishlistItem
+    wishlist_items = relationship("WishlistItem", back_populates="owner", cascade="all, delete-orphan")
+
+class WishlistItem(Base):
+    __tablename__ = "wishlist_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker_symbol = Column(String, index=True, nullable=False)
+    # Foreign Key to link to the User table
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    added_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationship to User
+    # 'back_populates' links this relationship to the 'wishlist_items' attribute in User
+    owner = relationship("User", back_populates="wishlist_items")
+
+    # To ensure a user can only add a ticker once to their wishlist:
+    # from sqlalchemy.schema import UniqueConstraint
+    # __table_args__ = (UniqueConstraint('user_id', 'ticker_symbol', name='_user_ticker_uc'),)
+Service Files (if you've started refactoring them):
+app/services/data_fetcher_service.py (or equivalent if you've adapted your prototype's data_fetcher.py)
+# app/services/data_fetcher_service.py
+import logging
+import time
+import re
+from datetime import datetime, timedelta, timezone
+
+import yfinance as yf
+from newsapi import NewsApiClient
+from newspaper import Article, ArticleException
+import praw
+
+from app.core.config import settings # Use backend settings
+
+log = logging.getLogger(__name__)
+
+# --- Initialize API Clients ---
+# Note: These are initialized when the module is loaded. For scalability,
+# consider managing clients within FastAPI's lifespan or using dependency injection.
+newsapi_client = None
+if settings.NEWSAPI_KEY:
+    try:
+        newsapi_client = NewsApiClient(api_key=settings.NEWSAPI_KEY)
+        log.info("NewsAPI client initialized.")
+    except Exception as e:
+        log.error(f"Failed to initialize NewsAPI client: {e}")
+else:
+    log.warning("NewsAPI client not initialized (NEWSAPI_KEY missing in config).")
+
+reddit_praw_client = None
+if settings.REDDIT_CLIENT_ID and settings.REDDIT_CLIENT_SECRET and settings.REDDIT_USER_AGENT:
+    try:
+        reddit_praw_client = praw.Reddit(
+            client_id=settings.REDDIT_CLIENT_ID,
+            client_secret=settings.REDDIT_CLIENT_SECRET,
+            user_agent=settings.REDDIT_USER_AGENT,
+            check_for_async=False
+        )
+        if reddit_praw_client.read_only:
+             log.info("PRAW Reddit client initialized successfully (read-only).")
+        else:
+             log.warning("PRAW Reddit client initialized, but read_only check failed or skipped.")
+    except Exception as e:
+        log.error(f"Failed to initialize PRAW Reddit client: {e}")
+else:
+    log.warning("Reddit API credentials not fully configured. Reddit fetching disabled.")
+
+# --- Helper Functions (Adapted from Streamlit version) ---
+def _is_relevant(text_content, ticker_symbol, company_name, min_len, min_mentions):
+    """Checks if the article text is relevant."""
+    if not text_content or len(text_content) < min_len:
+        return False
+    mentions = 0
+    try:
+        ticker_pattern = r'\b{}\b|\${}\b'.format(re.escape(ticker_symbol), re.escape(ticker_symbol))
+        mentions += len(re.findall(ticker_pattern, text_content, re.IGNORECASE))
+        if company_name and len(company_name) > 2:
+            company_pattern = r'\b{}\b'.format(re.escape(company_name))
+            mentions += len(re.findall(company_pattern, text_content, re.IGNORECASE))
+    except Exception as e:
+        log.error(f"Regex error during relevance check: {e}") # Avoid crashing on bad regex
+    return mentions >= min_mentions
+
+def _fetch_full_text_newspaper(url):
+    """Fetches full text using Newspaper3k."""
+    if not url: return None
+    try:
+        log.debug(f"Newspaper3k: Attempting fetch: {url}")
+        article = Article(url, language='en', fetch_images=False, memoize_articles=True)
+        article.download()
+        article.parse()
+        log.debug(f"Newspaper3k: Successfully parsed: {url}")
+        return article.text
+    except (ArticleException, Exception) as e:
+        log.warning(f"Newspaper3k failed for URL {url}: {e}")
+        return None
+
+# --- Main Fetching Functions for API ---
+def fetch_stock_info(ticker: str) -> dict | None:
+    """Fetches basic stock info using yfinance. API Version."""
+    log.info(f"Fetching stock info for {ticker} via yfinance.")
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        # Simplified logic from prototype - add more fallback/checks if needed
+        if not info or not info.get('symbol'):
+             log.warning(f"yfinance info for {ticker} is empty/invalid.")
+             # Attempt history as a basic fallback for price
+             hist = stock.history(period="2d")
+             if hist.empty:
+                  log.error(f"Cannot retrieve info or history for {ticker}.")
+                  return None
+             current_price = hist['Close'].iloc[-1] if not hist.empty else 'N/A'
+             company_name = ticker
+             # Return minimal info structure
+             return {
+                "symbol": ticker,
+                "company_name": company_name,
+                "current_price": current_price,
+                "currency": info.get('currency', 'N/A'), # Get currency if possible
+                "sector": "N/A",
+                "industry": "N/A",
+                "market_cap": None,
+                "error": "Incomplete data from yfinance info, used history fallback."
+            }
+        else:
+            current_price = info.get('currentPrice', info.get('regularMarketPrice', info.get('previousClose')))
+            company_name = info.get('longName', info.get('shortName', ticker))
+            return {
+                "symbol": info.get('symbol'),
+                "company_name": company_name,
+                "current_price": current_price if current_price is not None else 'N/A',
+                "currency": info.get('currency', info.get('financialCurrency')),
+                "sector": info.get('sector', 'N/A'),
+                "industry": info.get('industry', 'N/A'),
+                "market_cap": info.get('marketCap'),
+                "info": info # Include raw info dict if needed by frontend
+            }
+    except Exception as e:
+        log.error(f"Error fetching yfinance data for {ticker}: {e}", exc_info=True)
+        return None # Indicate failure
+
+def fetch_news_data_service(ticker_symbol: str, company_name: str, articles_count: int = 15) -> list[dict]:
+    """Fetches and processes NewsAPI data for the API."""
+    if not newsapi_client:
+        log.error("NewsAPI client not available for fetching news.")
+        return [] # Return empty list, endpoint handler can raise HTTPException
+
+    # Using values from config directly (consider passing them if needed)
+    # Assuming NEWS_DOMAIN_BLACKLIST, NEWS_SOURCE_NAME_BLACKLIST are in settings
+    # min_len = settings.MIN_ARTICLE_LENGTH_FOR_ANALYSIS
+    # min_mentions = settings.MIN_TICKER_MENTIONS_FOR_RELEVANCE
+    min_len = 100 # Example defaults if not in settings
+    min_mentions = 1 # Example defaults
+    domain_blacklist = getattr(settings, "NEWS_DOMAIN_BLACKLIST", []) # Use getattr for safety
+    source_blacklist = getattr(settings, "NEWS_SOURCE_NAME_BLACKLIST", [])
+
+
+    query = f'"{company_name}" OR "{ticker_symbol}"'
+    log.info(f"Fetching {articles_count} news for query: '{query}' (Service Layer)")
+    
+    try:
+        api_response = newsapi_client.get_everything(
+            q=query, language='en', sort_by='publishedAt',
+            page_size=min(articles_count * 2, 100), # Fetch more for filtering
+            page=1
+        )
+        articles_metadata = api_response.get('articles', [])
+    except Exception as e:
+        log.error(f"NewsAPI error in service for query '{query}': {e}", exc_info=True)
+        return []
+
+    processed_content = []
+    processed_urls = set()
+    for meta in articles_metadata:
+        title = meta.get('title')
+        url = meta.get('url')
+        published_at_str = meta.get('publishedAt')
+        source_info = meta.get('source', {})
+        source_name = source_info.get('name', 'Unknown News Source')
+
+        if not title or title == '[Removed]' or not url or url in processed_urls or not published_at_str:
+            continue
+        processed_urls.add(url)
+
+        # --- Filtering ---
+        try: # Domain filtering
+            domain = url.split('/')[2].replace('www.', '')
+            if domain in domain_blacklist: continue
+        except IndexError: pass # Ignore bad URLs for domain filter
+        if source_name in source_blacklist: continue # Source name filtering
+        # --- End Filtering ---
+
+        full_text = _fetch_full_text_newspaper(url)
+        if not full_text or len(full_text) < min_len:
+            full_text = meta.get('description', title)
+            if not full_text: full_text = title
+
+        # Use _is_relevant helper
+        if _is_relevant(full_text, ticker_symbol, company_name, min_len, min_mentions):
+            processed_content.append({
+                'id': url, # Use URL as ID for news consistency
+                'headline': title,
+                'full_text': full_text,
+                'url': url,
+                'publishedAt': published_at_str,
+                'source_name': source_name,
+                'source_type': 'news'
+            })
+            if len(processed_content) >= articles_count: break # Stop when count reached
+
+    log.info(f"Service fetched {len(processed_content)} relevant news articles for {ticker_symbol}.")
+    return processed_content
+
+def fetch_reddit_data_service(ticker_symbol: str, company_name: str, posts_limit: int = 10, comments_limit: int = 5) -> list[dict]:
+    """Fetches and processes Reddit data for the API."""
+    if not reddit_praw_client:
+        log.warning("Reddit client not available for fetching data.")
+        return []
+
+    # Assuming values from config are needed
+    # min_len = settings.MIN_ARTICLE_LENGTH_FOR_ANALYSIS
+    # min_mentions = settings.MIN_TICKER_MENTIONS_FOR_RELEVANCE
+    # relevant_subreddits = settings.RELEVANT_SUBREDDITS
+    # search_timespan = settings.REDDIT_SEARCH_TIMESPAN
+    min_len = 100 # Example defaults
+    min_mentions = 1
+    relevant_subreddits = ['stocks', 'investing', 'wallstreetbets'] # Example defaults
+    search_timespan = 'week'
+
+    search_query = f'"{company_name}" OR "{ticker_symbol}" OR "${ticker_symbol}"' # Simple query
+    log.info(f"Fetching Reddit data for query: '{search_query}' (Service Layer)")
+    processed_content = []
+    processed_ids = set()
+
+    for sub_name in relevant_subreddits:
+        # Add overall limit check if needed
+        try:
+            subreddit = reddit_praw_client.subreddit(sub_name)
+            for submission in subreddit.search(search_query, sort='new', time_filter=search_timespan, limit=posts_limit):
+                if submission.id in processed_ids: continue
+                
+                post_title = submission.title
+                post_body = submission.selftext or ""
+                combined_text = f"{post_title}. {post_body}"
+
+                if _is_relevant(combined_text, ticker_symbol, company_name, min_len, min_mentions):
+                    processed_ids.add(submission.id)
+                    processed_content.append({
+                        'id': submission.id,
+                        'headline': post_title[:250],
+                        'full_text': combined_text,
+                        'url': f"https://reddit.com{submission.permalink}",
+                        'publishedAt': datetime.fromtimestamp(submission.created_utc, timezone.utc).isoformat(),
+                        'source_name': f"r/{submission.subreddit.display_name}",
+                        'source_type': 'reddit_post',
+                        'author_name': submission.author.name if submission.author else "[deleted]",
+                        'item_score': submission.score,
+                        'num_comments_on_post': submission.num_comments,
+                    })
+                    # Comment fetching logic (simplified)
+                    # ... (add comment fetching loop similar to prototype's data_fetcher if needed) ...
+        except Exception as e:
+            log.error(f"Error fetching data from subreddit r/{sub_name}: {e}")
+            time.sleep(0.5)
+
+    log.info(f"Service fetched {len(processed_content)} relevant Reddit items for {ticker_symbol}.")
+    return processed_content
+
+# --- Placeholder for Indian News ---
+def fetch_indian_news_service(*args, **kwargs):
+     log.warning("Indian news fetching service not implemented.")
+     return []
+app/services/sentiment_service.py (or equivalent if you've adapted your prototype's sentiment_analyzer.py)
+# app/services/sentiment_service.py
+import logging
+import math
+from datetime import datetime, timezone
+from typing import List, Dict, Any
+
+from app.core.config import settings # Use backend settings
+# Import the getter for the loaded pipeline
+from app.sentiment_model_loader import get_sentiment_pipeline
+
+log = logging.getLogger(__name__)
+
+# --- Sentiment Analysis Core Logic ---
+def analyze_content_sentiment(content_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Analyzes sentiment for a list of fetched content items using the loaded pipeline."""
+    if not content_list:
+        log.warning("No content provided for sentiment analysis service.")
+        return []
+
+    try:
+        sentiment_pipeline = get_sentiment_pipeline() # Get the globally loaded pipeline
+    except RuntimeError as e:
+        log.error(f"Sentiment pipeline unavailable: {e}")
+        return [] # Cannot proceed without the model
+
+    log.info(f"Analyzing sentiment for {len(content_list)} items in service...")
+    analyzed_details_list = []
+    texts_for_analysis = []
+    original_items_map = []
+
+    for item in content_list:
+        text = item.get('full_text', item.get('headline'))
+        if text:
+            texts_for_analysis.append(text)
+            original_items_map.append(item)
+        else:
+            log.warning(f"Skipping item due to missing text: {item.get('url', item.get('id', 'N/A'))}")
+
+    if not texts_for_analysis:
+        log.warning("No valid text found in content items to analyze.")
+        return []
+
+    try:
+        # Perform analysis in batches
+        results = sentiment_pipeline(texts_for_analysis) # truncation=True is set during pipeline load
+
+        for i, result in enumerate(results):
+            original_item = original_items_map[i]
+            model_score = result['score']
+            model_label = result['label'].lower()
+
+            normalized_score = 0.0
+            if model_label == 'positive': normalized_score = model_score
+            elif model_label == 'negative': normalized_score = -model_score
+            # Neutral label maps to 0.0
+
+            # Prepare result, include identifier for potential DB updates later
+            item_id_for_update = original_item.get('id') # Reddit ID or News URL
+
+            analyzed_details_list.append({
+                'headline': original_item.get('headline', 'N/A'),
+                'url': original_item.get('url'),
+                'score': normalized_score,
+                'label': model_label,
+                'publishedAt': original_item.get('publishedAt'),
+                'source_name': original_item.get('source_name', 'Unknown'),
+                'source_type': original_item.get('source_type', 'unknown'),
+                'source_specific_id': item_id_for_update # ID for potential later use
+            })
+    except Exception as e:
+        log.error(f"Error during batch sentiment analysis in service: {e}", exc_info=True)
+        # Depending on policy, might return partial results or empty list
+        return [] # Return empty on error for now
+
+    log.info(f"Sentiment service produced details for {len(analyzed_details_list)} items.")
+    return analyzed_details_list
+
+# --- Weighted Score, Suggestion, Validation Points Logic (Adapted from Streamlit version) ---
+def calculate_final_sentiment_score(analyzed_details: List[Dict[str, Any]]) -> float:
+    """Calculates the final weighted sentiment score."""
+    if not analyzed_details: return 0.0
+
+    total_weighted_score = 0.0
+    total_weight = 0.0
+    now_utc = datetime.now(timezone.utc)
+    half_life_hours = getattr(settings, "RECENCY_DECAY_HALF_LIFE_HOURS", 72.0)
+    intensity_boost = getattr(settings, "INTENSITY_BOOST_FACTOR", 0.15)
+
+    for item in analyzed_details:
+        score = item.get('score', 0.0)
+        pub_str = item.get('publishedAt')
+        recency_weight = 0.1 # Default low weight
+
+        if pub_str:
+            try:
+                # Use the same parsing logic as database.py's _parse_datetime
+                if isinstance(pub_str, datetime): dt = pub_str
+                else:
+                     if pub_str.endswith('Z'): pub_str = pub_str[:-1] + '+00:00'
+                     dt = datetime.fromisoformat(pub_str)
+                
+                if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                else: dt = dt.astimezone(timezone.utc)
+                
+                age_hours = max(0, (now_utc - dt).total_seconds() / 3600.0)
+                recency_weight = math.exp(-math.log(2) * age_hours / half_life_hours)
+            except (ValueError, TypeError):
+                log.warning(f"Could not parse timestamp '{pub_str}' for recency weight.")
+
+        intensity_weight = 1.0 + (abs(score) * intensity_boost)
+        item_weight = recency_weight * intensity_weight
+
+        total_weighted_score += score * item_weight
+        total_weight += item_weight
+
+    if total_weight == 0: return 0.0
+    return total_weighted_score / total_weight
+
+def get_sentiment_suggestion(score: float) -> str:
+    """Maps score to suggestion."""
+    # Use thresholds (consider making these configurable via settings)
+    if score > 0.25: return "Strong Buy"
+    elif score > 0.05: return "Buy"
+    elif score >= -0.05: return "Hold"
+    elif score >= -0.25: return "Sell"
+    else: return "Strong Sell"
+
+def extract_validation_points(analyzed_details: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Selects key positive/negative items for justification."""
+    if not analyzed_details: return []
+
+    # Sort by score (descending)
+    sorted_results = sorted(analyzed_details, key=lambda x: x.get('score', 0.0), reverse=True)
+    
+    points = []
+    POS_THRESHOLD = 0.1
+    NEG_THRESHOLD = -0.1
+
+    # Top positive
+    if sorted_results and sorted_results[0].get('score', 0.0) > POS_THRESHOLD:
+        points.append({
+            "type": "positive",
+            "headline": sorted_results[0].get('headline'),
+            "url": sorted_results[0].get('url'),
+            "source": sorted_results[0].get('source_name'),
+            "score": sorted_results[0].get('score')
+        })
+
+    # Top negative
+    if sorted_results and sorted_results[-1].get('score', 0.0) < NEG_THRESHOLD:
+         points.append({
+            "type": "negative",
+            "headline": sorted_results[-1].get('headline'),
+            "url": sorted_results[-1].get('url'),
+            "source": sorted_results[-1].get('source_name'),
+            "score": sorted_results[-1].get('score')
+        })
+
+    # Add neutral/mixed example if few strong points
+    if len(points) < 2:
+         closest_neutral = min(analyzed_details, key=lambda x: abs(x.get('score', 0.0)), default=None)
+         if closest_neutral and closest_neutral not in [p.get('headline') for p in points if 'headline' in p]: # Avoid duplicates
+              points.append({
+                "type": "neutral",
+                "headline": closest_neutral.get('headline'),
+                "url": closest_neutral.get('url'),
+                "source": closest_neutral.get('source_name'),
+                "score": closest_neutral.get('score')
+              })
+
+    return points[:3] # Return top 3 justification points
+app/sentiment_model_loader.py (You've mentioned this, it would be good to see how the model is loaded and made available).
+# app/sentiment_model_loader.py
+import logging
+from transformers import pipeline, Pipeline # Pipeline type hint
+from app.core.config import settings
+import torch # Keep torch import for device check example
+
+# Configure logging for this module
+log = logging.getLogger(__name__)
+# Use basicConfig here or rely on FastAPI's logging setup if configured later
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(name)s] - %(message)s')
+
+# Global variable to hold the pipeline
+sentiment_pipeline_instance: Pipeline | None = None
+
+def load_sentiment_model():
+    """Loads the sentiment analysis model into the global instance."""
+    global sentiment_pipeline_instance
+    if sentiment_pipeline_instance is None:
+        model_name = settings.DEFAULT_SENTIMENT_MODEL
+        log.info(f"Attempting to load sentiment model: {model_name}")
+        try:
+            # Check for GPU availability explicitly if needed, otherwise pipeline auto-detects
+            device_num = 0 if torch.cuda.is_available() else -1
+            log.info(f"Using device: {'GPU 0' if device_num == 0 else 'CPU'} for Hugging Face pipeline.")
+
+            sentiment_pipeline_instance = pipeline(
+                "sentiment-analysis",
+                model=model_name,
+                # tokenizer=model_name, # Often optional
+                device=device_num,
+                truncation=True # Good default for potentially long texts
+            )
+            log.info(f"Sentiment analysis pipeline loaded successfully for model '{model_name}'.")
+        except Exception as e:
+            log.error(f"CRITICAL: Error loading sentiment model '{model_name}': {e}", exc_info=True)
+            # Depending on requirements, you might want the app to fail startup
+            # raise RuntimeError(f"Failed to load sentiment model: {e}") from e
+            sentiment_pipeline_instance = None # Ensure it remains None if loading failed
+    else:
+        # This shouldn't ideally happen if loaded only on startup, but good for debug
+        log.debug("Sentiment model already loaded.")
+
+def get_sentiment_pipeline() -> Pipeline:
+    """
+    Returns the loaded pipeline instance.
+    Raises RuntimeError if the pipeline hasn't been loaded successfully.
+    """
+    if sentiment_pipeline_instance is None:
+        # This indicates an issue with application startup logic
+        log.error("FATAL: get_sentiment_pipeline called before model was loaded!")
+        raise RuntimeError("Sentiment analysis model is not available.")
+    return sentiment_pipeline_instance
+
+# NOTE: load_sentiment_model() will be called via a FastAPI startup event in main.py
+Dependencies File (Optional but helpful):
+app/api/deps.py (To see how you're handling dependencies like get_current_user).
+# app/api/deps.py
+from typing import Generator # For Python < 3.9, use from typing_extensions import Annotated for Python 3.9+ for Depends type hints
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.core import security # Your security.py
+from app.db import models # Your db/models.py
+from app.db.database import SessionLocal, get_db # Your db/database.py
+from app.crud import crud_user # Your crud_user.py
+
+# OAuth2PasswordBearer tells FastAPI where to look for the token (e.g., Authorization header)
+# tokenUrl should point to your login endpoint
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token") # Adjust tokenUrl to your actual login path
+
+async def get_current_user(
+    db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)
+) -> models.User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    token_data = security.decode_access_token(token)
+    if not token_data or not token_data.identifier: # identifier is what we stored in 'sub' (e.g., email)
+        raise credentials_exception
+    
+    # Assuming identifier is the email. Adjust if you use username or user ID.
+    user = crud_user.get_user_by_email(db, email=token_data.identifier)
+    if user is None:
+        raise credentials_exception
+    if not user.is_active: # Optional: check if user is active
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return user
+
+async def get_current_active_user(
+    current_user: models.User = Depends(get_current_user)
+) -> models.User:
+    # This is a simple wrapper if you only want to ensure the user from get_current_user is active
+    # The active check is already in get_current_user, but this makes it explicit for routes.
+    if not current_user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
