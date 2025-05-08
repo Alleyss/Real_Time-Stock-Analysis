@@ -284,8 +284,8 @@ const StockDetailPage: React.FC = () => {
                                         </span>
                                     </div>
                                     <div className="flex justify-between items-center text-sm">
-                                        <span>Suggestion:</span>
-                                        <span className="font-bold text-base">{sentimentResult.suggestion}</span>
+                                        <span id='suggestion'>Suggestion:</span>
+                                        <span id='suggestion1'className="font-bold text-base">{sentimentResult.suggestion}</span>
                                     </div>
                                     <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">Based on {sentimentResult.analyzed_articles_count} analyzed items.</p>
                                </div>
