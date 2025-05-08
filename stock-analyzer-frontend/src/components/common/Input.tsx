@@ -1,30 +1,32 @@
 // src/components/common/Input.tsx
 import React from 'react';
 
-interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> {
-  label?: string;
-  error?: string;
-}
+// ... (interface definition same as before) ...
 
-const Input: React.FC<InputProps> = ({ label, name, error, ...rest }) => {
+const Input: React.FC<InputProps> = ({ label, name, error, className = '', ...rest }) => {
   return (
-    <div className="mb-4">
+    <div className={`mb-4 ${className}`}> {/* Allow passing className to container */}
       {label && (
-        <label htmlFor={name} className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+        <label htmlFor={name} className="block text-sm font-medium text-[var(--text-secondary)] mb-1">
           {label}
         </label>
       )}
       <input
         id={name}
         name={name}
-        className={`w-full px-3 py-2 border ${
-          error ? 'border-red-500' : 'border-gray-300 dark:border-gray-600'
-        } rounded-md shadow-sm focus:outline-none focus:ring-2 ${
-          error ? 'focus:ring-red-500' : 'focus:ring-blue-500'
-        } focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 sm:text-sm`}
+        // Use CSS variables, refine focus styles with neon accent
+        className={`
+          w-full px-3 py-2 border rounded-md shadow-sm
+          bg-[var(--bg-secondary)] border-[var(--border-color)] text-[var(--text-primary)]
+          placeholder:text-[var(--text-muted)]
+          focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary)] focus:border-transparent
+          disabled:opacity-50 disabled:cursor-not-allowed
+          sm:text-sm transition-colors duration-150 ease-in-out
+          ${error ? 'border-red-500 focus:ring-red-500' : ''}
+        `}
         {...rest}
       />
-      {error && <p className="mt-1 text-xs text-red-500">{error}</p>}
+      {error && <p className="mt-1 text-xs text-red-500 dark:text-red-400">{error}</p>}
     </div>
   );
 };
