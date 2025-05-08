@@ -1,4 +1,3 @@
-// src/components/auth/LoginForm.tsx
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
@@ -27,33 +26,35 @@ const LoginForm: React.FC = () => {
   };
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-6">
-      {authError && !formError && <p className="text-red-500 text-sm text-center">{authError}</p>}
-      {formError && <p className="text-red-500 text-sm text-center">{formError}</p>}
-      <Input
-        label="Email address"
-        type="email"
-        name="email"
-        value={email}
-        onChange={(e) => setEmail(e.target.value)}
-        required
-        autoComplete="email"
-      />
-      <Input
-        label="Password"
-        type="password"
-        name="password"
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        required
-        autoComplete="current-password"
-      />
-      <div>
-        <Button type="submit" isLoading={isLoading}>
-          Sign in
-        </Button>
-      </div>
-    </form>
+    <div className="card max-w-md mx-auto p-6">
+      <form onSubmit={handleSubmit} className="space-y-6">
+        {authError && !formError && <p className="text-red-500 text-sm text-center">{authError}</p>}
+        {formError && <p className="text-red-500 text-sm text-center">{formError}</p>}
+        <Input
+          label="Email address"
+          type="email"
+          name="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          required
+          autoComplete="email"
+        />
+        <Input
+          label="Password"
+          type="password"
+          name="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          required
+          autoComplete="current-password"
+        />
+        <div>
+          <Button type="submit" isLoading={isLoading}>
+            Sign in
+          </Button>
+        </div>
+      </form>
+    </div>
   );
 };
 
