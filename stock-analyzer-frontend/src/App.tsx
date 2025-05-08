@@ -5,6 +5,7 @@ import {
     Route, 
     Navigate 
 } from 'react-router-dom';
+import './styles.css';
 
 // Import Components
 import Navbar from './components/common/Navbar';
@@ -15,7 +16,7 @@ import AuthPage from './pages/AuthPage';
 import DashboardPage from './pages/DashboardPage';
 import StockDetailPage from './pages/StockDetailPage';
 // import WishlistPage from './pages/WishlistPage'; // Uncomment if you create a separate wishlist page
-
+import { Toaster } from 'react-hot-toast'; // <<< IMPORT
 // Import Auth Context Hook
 import { useAuth } from './contexts/AuthContext';
 
@@ -52,6 +53,7 @@ function App() {
 
   return (
     <Router>
+      <Toaster position="top-center" reverseOrder={false} /> {/* <<< ADD Toaster */}
       <div className="flex flex-col min-h-screen bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100 font-sans"> {/* Added font-sans example */}
         <Navbar /> {/* Render Navbar on all pages */}
         
