@@ -1,0 +1,16 @@
+streamlit 
+yfinance 
+newsapi-python 
+requests 
+beautifulsoup4 
+transformers 
+torch 
+python-dotenv
+newspaper3k
+praw 
+fastapi 
+"uvicorn[standard]" 
+pydantic[email] 
+python-jose[cryptography] 
+passlib[bcrypt] 
+psycopg2-binary

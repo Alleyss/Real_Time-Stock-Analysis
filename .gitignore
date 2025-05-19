@@ -1,3 +1,5 @@
 venv
 .env
 __pycache__
+backend\stock_api.db
+stocks_analysis.db
